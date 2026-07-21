@@ -60,7 +60,7 @@ keyword_search_chain = keyword_search_prompt | keyword_llm.with_structured_outpu
 )
 
 
-journey_search_prompt = PromptTemplate.from_template(
+journey_route_search_prompt = PromptTemplate.from_template(
     """
 사용자의 질문에서 성경 속 인물이나 집단의 이동 여정을 파악하고,
 관련 장소명을 실제 이동 순서대로 최대 10개까지 반환하세요.
@@ -89,7 +89,7 @@ journey_search_prompt = PromptTemplate.from_template(
 )
 
 
-class JourneyResult(BaseModel):
+class JourneyRouteResult(BaseModel):
     places: list[str] = Field(
         default_factory=list,
         max_length=10,
@@ -100,8 +100,52 @@ class JourneyResult(BaseModel):
     )
 
 
-journey_search_chain = journey_search_prompt | journey_llm.with_structured_output(
-    JourneyResult
+journey_route_search_chain = (
+    journey_route_search_prompt | journey_llm.with_structured_output(JourneyRouteResult)
+)
+
+
+journey_description_search_prompt = PromptTemplate.from_template(
+    """
+사용자의 질문에서 언급되거나 암시된 성경 여정을 파악하고,
+그 여정에 대한 간결한 서술적 설명을 작성하세요.
+
+규칙:
+- 여정의 주요 인물(또는 집단), 시대적·역사적 배경, 목적, 신학적·성경적 의미를
+  중심으로 3~5문장 이내로 요약하세요.
+- 구체적인 장소들의 이동 순서는 별도 도구(journey_route_search)에서 다루므로
+  나열 형식이 아닌 서술 형식으로 작성하세요.
+- 여정이 아니거나 여정을 특정할 수 없으면 빈 문자열을 반환하세요.
+
+예시:
+질문: 바울의 1차 전도여행은 어떤 여행이었어?
+답변: 바울과 바나바가 안디옥 교회의 파송을 받아 떠난 최초의 이방 선교 여행이다. 구브로 섬을 시작으로 소아시아 남부의 여러 도시에서 복음을 전했으며, 이방인에게도 구원의 문이 열려 있음을 보여준 결정적 사건으로 평가된다.
+
+질문: 요셉이 형들에게 팔린 곳은 어디인가요?
+답변:
+
+질문: 천국은 어디에 있나요?
+답변:
+
+질문: {query}
+답변:
+"""
+)
+
+
+class JourneyDescriptionResult(BaseModel):
+    description: str = Field(
+        default="",
+        description=(
+            "성경 여정의 배경·목적·의미를 담은 짧은 서술 텍스트. "
+            "여정이 아니거나 특정할 수 없으면 빈 문자열."
+        ),
+    )
+
+
+journey_description_search_chain = (
+    journey_description_search_prompt
+    | journey_llm.with_structured_output(JourneyDescriptionResult)
 )
 
 
@@ -127,40 +171,21 @@ class ModernPlaceRecord(TypedDict):
 @tool
 def search_ancient_places(
     keywords: list[str],
-    top_k_per_keyword: int = 1,
+    top_k_per_keyword: int = 3,
 ) -> list[PlaceSearchResult]:
-    """고대 성경 장소 이름 키워드 목록으로 지명 데이터를 검색합니다.
+    """고대 성경 장소 이름 키워드 목록으로 지명 데이터를 벡터 검색합니다.
 
-    각 키워드마다 벡터 DB(parent 네임스페이스)에서 관련 지명 레코드를
-    찾아 반환합니다. 키워드는 다음 세 방식 중 하나로 얻을 수 있습니다.
-
-    1) 질문에 명확한 고대 지명이 이미 들어 있으면 그 지명을 그대로 넘겨
-       바로 호출합니다. 예: "베들레헴은 어떤 곳이야?" → keywords=["베들레헴"]
-    2) 질문이 사건·인물·지리 단서만 주고 지명을 직접 언급하지 않는다면
-       먼저 ancient_keyword_search로 후보 장소명을 추출한 뒤 그 결과를
-       그대로 keywords에 넘깁니다.
-    3) 질문이 인물·집단의 이동 경로나 여정 순서를 묻는다면 먼저
-       journey_search로 여정상의 장소 목록을 얻은 뒤 그 리스트를
-       그대로 keywords에 넘겨 각 지점의 지명 정보를 조회합니다.
-
-    다음과 같은 상황에 사용합니다.
-    - 질문에 나오는 고대 지명(예: "시글락", "아골 골짜기")의 상세 정보 조회
-    - ancient_keyword_search로 추출한 후보 장소명들을 실제 레코드로 확장
-    - journey_search가 반환한 여정 장소들의 상세 지명 데이터 조회
-    - 여러 고대 지명을 한 번에 묶어 조회
-
-    다음 상황에는 사용하지 마세요.
-    - 여정 자체의 이동 순서 확보: journey_search 사용
-    - 고대 지명의 현대 위치 후보 조회: fetch_modern_places_by_names 사용
-    - 성경 본문 원문 조회: get_bible_passages 사용
+    각 키워드를 임베딩해 Pinecone places 인덱스의 parent 네임스페이스에서
+    가장 유사한 고대 지명 레코드를 찾아 반환합니다.
 
     Args:
         keywords: 조회할 고대 성경 지명 이름 목록. 최대 5개까지 처리됩니다.
-        top_k_per_keyword: 키워드별로 반환할 후보 수. 기본값 1, 1~2 사이로 제한됩니다.
+        top_k_per_keyword: 키워드별 후보 수. 기본값 3, 1~5 사이로 제한됩니다.
 
     Returns:
-        검색된 고대 지명의 place_id, 한글/영문 이름, 지명 유형,
-        관련 성경 구절, 본문 내용. place_id 기준으로 중복은 제거됩니다.
+        고대 지명의 place_id, 한글/영문 이름, 지명 유형, 관련 성경 구절,
+        현대 위치 후보 이름(identification_names), 본문 설명.
+        place_id 기준으로 중복은 제거됩니다.
     """
     normalized_keywords = [kw.strip() for kw in keywords if kw and kw.strip()]
 
@@ -168,7 +193,7 @@ def search_ancient_places(
         return []
 
     limited_keywords = normalized_keywords[:5]
-    normalized_top_k = max(1, min(top_k_per_keyword, 2))
+    normalized_top_k = max(1, min(top_k_per_keyword, 5))
 
     embeddings = openai_client.embeddings.create(
         model=EMBEDDING_MODEL,
@@ -213,27 +238,19 @@ def fetch_modern_places_by_names(
     names: list[str],
     top_k_per_name: int = 1,
 ) -> list[ModernPlaceRecord]:
-    """현대 지명 이름 목록으로 관련 현대 지명 레코드를 검색합니다.
+    """현대 지명 이름 목록으로 현대 지명 레코드를 벡터 검색합니다.
 
-    각 이름을 임베딩하여 벡터 DB(child 네임스페이스)에서 가장 유사한
-    현대 지명 레코드를 찾아 반환합니다.
-
-    다음과 같은 상황에 사용합니다.
-    - search_ancient_places 결과의 identification_names(고대 지명과 동일시되는
-      현대 지명 후보들)로 실제 현대 지명 레코드를 조회할 때
-    - 이미 알고 있는 현대 지명 이름들(예: "텔 키숀", "쿰란")의 상세 정보를
-      한 번에 조회할 때
-
-    다음 상황에는 사용하지 마세요.
-    - 고대 성경 지명을 검색할 때: search_ancient_places 사용
+    각 이름을 임베딩해 Pinecone places 인덱스의 child 네임스페이스에서
+    가장 유사한 현대 지명 레코드를 찾아 반환합니다.
 
     Args:
         names: 조회할 현대 지명 이름 목록. 최대 10개까지 처리됩니다.
-        top_k_per_name: 이름별로 반환할 후보 수. 기본값 1, 1~2 사이로 제한됩니다.
+        top_k_per_name: 이름별 후보 수. 기본값 1, 1~2 사이로 제한됩니다.
 
     Returns:
-        조회된 현대 지명의 place_id, 한글/영문 이름, 지명 유형,
-        관련된 성경 장소 ID 목록, 본문 내용. place_id 기준으로 중복은 제거됩니다.
+        현대 지명의 place_id, 한글/영문 이름, 지명 유형,
+        연관된 고대 성경 장소 ID 목록(parent_ids), 본문 설명.
+        place_id 기준으로 중복은 제거됩니다.
     """
     normalized_names = [name.strip() for name in names if name and name.strip()]
 
@@ -281,31 +298,39 @@ def fetch_modern_places_by_names(
 
 
 @tool
-def journey_search(query: str) -> list[str]:
-    """
-    성경 인물이나 집단의 이동 경로, 전도 여행 또는 여정의 순서를
-    묻는 질문에 사용한다.
+def journey_route_search(query: str) -> list[str]:
+    """성경 여정의 장소 순서(route)를 추출합니다.
 
-    질문에서 요구하는 여정의 장소들을 출발지부터 도착지까지
-    실제 이동 순서대로 반환한다. 반환된 장소명 리스트는
-    search_ancient_places의 keywords 인자로 그대로 넘겨
-    각 지점의 상세 지명 데이터를 조회할 수 있다.
+    질문에서 언급되거나 암시된 성경 인물·집단의 이동 여정을 파악하고,
+    관련 장소들을 출발지부터 도착지까지 이동 순서대로 최대 10개까지
+    이름 문자열 리스트로 반환합니다. 여정이 아니거나 특정할 수 없으면
+    빈 리스트를 반환합니다.
     """
-    result = journey_search_chain.invoke({"query": query})
+    result = journey_route_search_chain.invoke({"query": query})
     return result.places
 
 
 @tool
-def ancient_keyword_search(query: str) -> list[str]:
+def journey_description_search(query: str) -> str:
+    """성경 여정에 대한 서술적 설명 텍스트를 생성합니다.
+
+    질문에서 언급되거나 암시된 성경 여정의 주요 인물, 시대·역사적 배경,
+    목적, 신학적·성경적 의미를 3~5문장의 자연어로 요약해 반환합니다.
+    이동 장소의 순서는 다루지 않습니다. 여정이 아니거나 특정할 수 없으면
+    빈 문자열을 반환합니다.
     """
-    사용자의 질문이 성경의 사건, 인물의 행동 또는 지리적 특징을 통해
-    특정 고대 성경 장소를 묻는 경우 사용한다.
+    result = journey_description_search_chain.invoke({"query": query})
+    return result.description
 
-    질문의 단서를 분석하여 정답일 가능성이 높은 장소명을
-    최대 3개까지 반환한다.
 
-    일반적인 성경 지식, 신학적 개념 또는 지도에서 특정할 수 없는 장소를
-    묻는 질문에는 사용하지 않는다.
+@tool
+def ancient_keyword_search(query: str) -> list[str]:
+    """질문에서 정답일 가능성이 높은 고대 성경 장소 이름 후보를 추출합니다.
+
+    사건·인물·지리적 단서를 분석해 관련 장소 엔티티명을 최대 3개까지
+    문자열 리스트로 반환합니다. 도시·성읍·지역뿐 아니라 산·강·광야·
+    신전·건물·우물 등도 포함됩니다. 장소를 특정할 수 없으면 빈 리스트를
+    반환합니다.
     """
     result = keyword_search_chain.invoke({"query": query})
     return result.keywords
@@ -315,9 +340,11 @@ __all__ = [
     "PlaceSearchResult",
     "ModernPlaceRecord",
     "KeywordResult",
-    "JourneyResult",
+    "JourneyRouteResult",
+    "JourneyDescriptionResult",
     "search_ancient_places",
     "fetch_modern_places_by_names",
-    "journey_search",
+    "journey_route_search",
+    "journey_description_search",
     "ancient_keyword_search",
 ]
