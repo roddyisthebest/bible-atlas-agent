@@ -20,6 +20,7 @@ The runtime layout:
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Literal
 
 from dotenv import load_dotenv
@@ -143,14 +144,10 @@ def router(state: AgentState) -> str:
 # ---------------------------------------------------------------------------
 # place_agent
 # ---------------------------------------------------------------------------
-PLACE_AGENT_SYSTEM = """성경 지리·지명 에이전트. 규칙:
-
-1. 명확한 고대 지명이 있으면 search_ancient_places 직행. 단서만 있으면 ancient_keyword_search 먼저.
-2. 여정 질문은 journey_route_search + journey_description_search 병렬 호출.
-3. "현재/지금 위치" 관련이면 반드시 순차: search_ancient_places → identification_names 값을 fetch_modern_places_by_names.names에 전달. (병렬 금지, 고대명 직접 입력 금지)
-4. journey_route_search 결과는 search_ancient_places.keywords로 넘겨 각 지점 상세 조회.
-5. 답변 텍스트의 지명은 tool 반환 name_ko/name_en을 원문 그대로 인용. 축약·변형 금지. (프론트 매칭용)
-"""
+# PRD (docs/agent-prd.md) 가 시스템 프롬프트의 canonical source.
+# workflow.py는 agents/places/에 있으므로 parent.parent.parent = 프로젝트 루트.
+_PRD_PATH = Path(__file__).resolve().parent.parent.parent / "docs" / "agent-prd.md"
+PLACE_AGENT_SYSTEM = _PRD_PATH.read_text(encoding="utf-8")
 
 
 def place_agent(state: AgentState) -> dict:
