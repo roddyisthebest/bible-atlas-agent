@@ -1,0 +1,20 @@
+{
+  "_meta": {
+    "source": "data/ai-places-data/merged-page-0.json",
+    "description": "Retrieval regression test fixture. 5 parent + 5 child records extracted with minimal fields (id, stereo, name, koreanName, types). Kept small and committed so tests run on GitHub without the full data/ai-places-data/ directory.",
+    "policy": "Data/ai-places-data 는 gitignore 대상이므로 CI 에서는 이 fixture 만으로 name-based lookup 회귀를 검증한다. Postgres DB 에는 최소한 아래 id 10 개가 존재해야 함."
+  },
+  "data": [
+    { "id": "aea17b7", "stereo": "parent", "name": "Abana",              "koreanName": "아바나",            "types": ["river"] },
+    { "id": "aa8275b", "stereo": "parent", "name": "Abarim",             "koreanName": "아바림",            "types": ["mountain range"] },
+    { "id": "a72a1ff", "stereo": "parent", "name": "Abdon",              "koreanName": "압돈",              "types": ["settlement"] },
+    { "id": "abffcaa", "stereo": "parent", "name": "Abel-beth-maacah",   "koreanName": "아벨-벳-마아가",    "types": ["settlement"] },
+    { "id": "a957c5b", "stereo": "parent", "name": "Abel-keramim",       "koreanName": "아벨-그라밈",       "types": ["settlement"] },
+
+    { "id": "m39ac0b", "stereo": "child",  "name": "Barada River",         "koreanName": "바라다 강",           "types": ["river"] },
+    { "id": "m207993", "stereo": "child",  "name": "Abarim",               "koreanName": "아바림",              "types": ["mountain range"] },
+    { "id": "m2bcf45", "stereo": "child",  "name": "Tel Avdon",            "koreanName": "텔 아브돈",           "types": ["settlement"] },
+    { "id": "m1d43c6", "stereo": "child",  "name": "Tel Abel Beth Maacah", "koreanName": "텔 아벨 벳 마아가",   "types": ["settlement"] },
+    { "id": "m4433dc", "stereo": "child",  "name": "Sahab",                "koreanName": "사합",                "types": ["settlement"] }
+  ]
+}

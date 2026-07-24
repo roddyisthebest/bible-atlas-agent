@@ -1,0 +1,11 @@
+question,answer
+예루살렘은 성경에서 어떤 곳이야?,search_ancient_places
+엘리야가 바알 선지자들과 대결한 장소는 어디야?,ancient_keyword_search|search_ancient_places
+아브라함이 하란을 떠난 뒤 이동한 경로를 순서대로 알려줘,journey_route_search+journey_description_search|search_ancient_places
+니느웨는 현재 어느 지역에 해당해?,search_ancient_with_modern
+야곱이 돌베개를 베고 꿈을 꾼 곳은 지금 어디야?,ancient_keyword_search|search_ancient_with_modern
+현대의 텔 단 유적지는 성경의 어떤 장소에 해당해?,search_modern_with_ancient
+현재 도시 나블루스는 성경의 어떤 고대 지명과 연결돼?,search_modern_with_ancient
+가버나움과 나사렛은 각각 어떤 곳이야?,search_ancient_places
+바울이 가이사랴에서 로마까지 이동한 경로를 알려줘,journey_route_search+journey_description_search|search_ancient_places
+베들레헴은 지금 어디이고 현대의 텔 므깃도는 성경의 어떤 장소야?,search_ancient_with_modern+search_modern_with_ancient

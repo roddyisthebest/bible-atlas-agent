@@ -24,25 +24,22 @@ from pathlib import Path
 from typing import Literal
 
 from dotenv import load_dotenv
-from langchain_core.messages import (
-    AIMessage,
-    HumanMessage,
-    SystemMessage,
-    ToolMessage,
-)
+from langchain.agents import create_agent
+from langchain_core.messages import ToolMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, MessagesState, StateGraph
-from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel, Field
 
 from agents.places.place_tools import (
     ancient_keyword_search,
-    fetch_modern_places_by_names,
     journey_description_search,
     journey_route_search,
     search_ancient_places,
+    search_ancient_with_modern,
+    search_modern_places,
+    search_modern_with_ancient,
 )
 
 load_dotenv()
@@ -63,7 +60,9 @@ class AgentState(MessagesState):
 
     query: str
     answer: str
-    place_id_map: dict[str, str]
+    # 이름 → [place_id, ...]. 같은 이름이 여러 record 에 걸릴 수 있어 리스트.
+    # 프론트는 id 첫 글자로 stereo 판별 (a... = ancient, m... = modern).
+    place_id_map: dict[str, list[str]]
     recommended_questions: list[str]
 
 
@@ -81,15 +80,17 @@ rewrite_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2, max_tokens=500)
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
+# create_agent 가 내부적으로 llm.bind_tools + tool loop 를 처리하므로
+# 별도의 llm_with_tools / tool_node 는 만들지 않는다.
 tool_list = [
-    search_ancient_places,
-    journey_description_search,
-    journey_route_search,
-    fetch_modern_places_by_names,
     ancient_keyword_search,
+    search_ancient_places,
+    search_modern_places,
+    search_ancient_with_modern,
+    search_modern_with_ancient,
+    journey_route_search,
+    journey_description_search,
 ]
-llm_with_tools = llm.bind_tools(tool_list)
-tool_node = ToolNode(tool_list)
 
 
 # ---------------------------------------------------------------------------
@@ -149,12 +150,19 @@ def router(state: AgentState) -> str:
 _PRD_PATH = Path(__file__).resolve().parent.parent.parent / "docs" / "agent-prd.md"
 PLACE_AGENT_SYSTEM = _PRD_PATH.read_text(encoding="utf-8")
 
+# create_agent 가 tool 호출 loop 를 내부에서 처리 (LangGraph 최적화된 ReAct 구현).
+_place_agent_runnable = create_agent(
+    model=llm,
+    tools=tool_list,
+    system_prompt=PLACE_AGENT_SYSTEM,
+)
+
 
 def place_agent(state: AgentState) -> dict:
-    response = llm_with_tools.invoke(
-        [SystemMessage(content=PLACE_AGENT_SYSTEM)] + state["messages"]
-    )
-    return {"messages": [response]}
+    """tool loop 는 내부에서 완료. 새로 추가된 messages 만 delta 로 반환."""
+    initial_count = len(state["messages"])
+    result = _place_agent_runnable.invoke({"messages": state["messages"]})
+    return {"messages": result["messages"][initial_count:]}
 
 
 # ---------------------------------------------------------------------------
@@ -308,9 +316,33 @@ def rewrite(state: AgentState) -> dict:
 # ---------------------------------------------------------------------------
 # format (place_id 매핑 추출 + 답변 확정)
 # ---------------------------------------------------------------------------
-def _extract_place_refs(tool_message_content: str) -> dict[str, str]:
-    """도구 결과 JSON에서 {이름: place_id} 매핑을 뽑는다."""
-    refs: dict[str, str] = {}
+def _extract_place_refs(tool_message_content: str) -> dict[str, list[str]]:
+    """도구 결과 JSON 에서 {이름: [place_id, ...]} 매핑을 뽑는다.
+
+    - top-level record + nested modern_places / ancient_places 재귀 순회.
+    - 같은 이름에 여러 place_id 가 붙을 수 있음 (부모/자식 동일 영문명 등).
+    - id 첫 글자로 stereo 판별 가능 (a... = ancient, m... = modern).
+    """
+    refs: dict[str, list[str]] = {}
+
+    def _add(name: str, pid: str) -> None:
+        bucket = refs.setdefault(name, [])
+        if pid not in bucket:
+            bucket.append(pid)
+
+    def _walk(item):
+        if not isinstance(item, dict):
+            return
+        pid = item.get("place_id")
+        if pid:
+            for key in ("name_ko", "name_en"):
+                name = item.get(key)
+                if name:
+                    _add(name, pid)
+        for nested_key in ("modern_places", "ancient_places"):
+            for nested_item in item.get(nested_key) or []:
+                _walk(nested_item)
+
     try:
         data = json.loads(tool_message_content)
     except (TypeError, ValueError):
@@ -318,26 +350,27 @@ def _extract_place_refs(tool_message_content: str) -> dict[str, str]:
     if not isinstance(data, list):
         return refs
     for item in data:
-        if not isinstance(item, dict):
-            continue
-        place_id = item.get("place_id")
-        if not place_id:
-            continue
-        for key in ("name_ko", "name_en"):
-            name = item.get(key)
-            if name:
-                refs[name] = place_id
+        _walk(item)
     return refs
+
+
+def _merge_refs(dst: dict[str, list[str]], src: dict[str, list[str]]) -> None:
+    for name, ids in src.items():
+        bucket = dst.setdefault(name, [])
+        for pid in ids:
+            if pid not in bucket:
+                bucket.append(pid)
 
 
 def format(state: AgentState) -> dict:
     messages = state["messages"]
-    answer_text = messages[-1].content
+    # rewrite 에서 answer 이미 세팅됐으면 그것 보존, 아니면 마지막 메시지 사용
+    answer_text = state.get("answer") or messages[-1].content
 
-    place_id_map: dict[str, str] = {}
+    place_id_map: dict[str, list[str]] = {}
     for msg in messages:
         if isinstance(msg, ToolMessage):
-            place_id_map.update(_extract_place_refs(msg.content))
+            _merge_refs(place_id_map, _extract_place_refs(msg.content))
 
     return {"answer": answer_text, "place_id_map": place_id_map}
 
@@ -345,15 +378,8 @@ def format(state: AgentState) -> dict:
 # ---------------------------------------------------------------------------
 # route_from_agent (conditional edge)
 # ---------------------------------------------------------------------------
-def route_from_agent(state: AgentState) -> Literal["tools", "rewrite", "format"]:
-    """place_agent 이후 다음 노드 결정.
-
-    - tool 호출이 남아있으면 tools로
-    - 끝났으면 evaluate_answer 결과에 따라 rewrite / format으로
-    """
-    last_message = state["messages"][-1]
-    if getattr(last_message, "tool_calls", None):
-        return "tools"
+def route_from_agent(state: AgentState) -> Literal["rewrite", "format"]:
+    """tool loop 는 create_agent 내부에서 완료됨. 여기선 답변 평가만 분기."""
     return evaluate_answer(state)
 
 
@@ -363,7 +389,6 @@ def route_from_agent(state: AgentState) -> Literal["tools", "rewrite", "format"]
 graph_builder = StateGraph(AgentState)
 
 graph_builder.add_node("place_agent", place_agent)
-graph_builder.add_node("tools", tool_node)
 graph_builder.add_node("bible_general_agent", bible_general_agent)
 graph_builder.add_node("non_bible_reject", non_bible_reject)
 graph_builder.add_node("rewrite", rewrite)
@@ -376,16 +401,16 @@ graph_builder.add_conditional_edges(START, router, {
 })
 
 graph_builder.add_conditional_edges("place_agent", route_from_agent, {
-    "tools": "tools",
     "rewrite": "rewrite",
     "format": "format",
 })
 
-graph_builder.add_edge("tools", "place_agent")
+# rewrite 도 format 을 거쳐서 place_id_map 을 채우고 종료
+graph_builder.add_edge("rewrite", "format")
+
 graph_builder.add_edge("bible_general_agent", END)
 graph_builder.add_edge("non_bible_reject", END)
 graph_builder.add_edge("format", END)
-graph_builder.add_edge("rewrite", END)
 
 graph = graph_builder.compile()
 

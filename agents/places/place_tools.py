@@ -219,6 +219,28 @@ class ModernPlaceRecord(TypedDict):
     text: str | None
 
 
+class AncientWithModernResult(TypedDict):
+    """search_ancient_with_modern 반환 타입. parent + join 된 modern candidates."""
+    place_id: str
+    name_ko: str | None
+    name_en: str | None
+    types: list[str] | None
+    bible_references: list[str] | None
+    identification_names: list[str] | None
+    text: str | None
+    modern_places: list[ModernPlaceRecord]
+
+
+class ModernWithAncientResult(TypedDict):
+    """search_modern_with_ancient 반환 타입. child + join 된 ancient parents."""
+    place_id: str
+    name_ko: str | None
+    name_en: str | None
+    types: list[str] | None
+    text: str | None
+    ancient_places: list[PlaceSearchResult]
+
+
 # ---------------------------------------------------------------------------
 # Postgres query for name-based lookup
 # ---------------------------------------------------------------------------
@@ -251,60 +273,159 @@ LIMIT %(limit)s
 """
 
 
-def _lookup_by_name(keyword: str, stereo: str, limit: int) -> list[tuple]:
+def _lookup_by_name(name: str, stereo: str, limit: int) -> list[tuple]:
     """이름으로 places 테이블 조회."""
     with _pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 _LOOKUP_SQL,
-                {"stereo": stereo, "kw": keyword, "limit": limit},
+                {"stereo": stereo, "kw": name, "limit": limit},
             )
             return cur.fetchall()
 
 
+# ---------------------------------------------------------------------------
+# JOIN queries — 한 왕복으로 parent+children (또는 child+parents) 함께 조회
+# ---------------------------------------------------------------------------
+_ANCIENT_WITH_MODERN_SQL = """
+SELECT
+    p.id,
+    p.korean_name,
+    p.name,
+    p.types,
+    p.verses,
+    p.korean_description,
+    p.description,
+    p.identification_names,
+    COALESCE(
+        (
+            SELECT json_agg(
+                json_build_object(
+                    'place_id', c.id,
+                    'name_ko', c.korean_name,
+                    'name_en', c.name,
+                    'types', c.types,
+                    'parent_ids', c.parent_ids,
+                    'text', COALESCE(c.korean_description, c.description)
+                )
+            )
+            FROM places c
+            WHERE c.stereo = 'child'
+              AND c.id = ANY(p.identification_ids)
+        ),
+        '[]'::json
+    ) AS modern_places
+FROM places p
+WHERE p.stereo = 'parent'
+  AND (
+        p.korean_name ILIKE '%%' || %(kw)s || '%%'
+     OR p.name ILIKE '%%' || %(kw)s || '%%'
+  )
+ORDER BY
+    (p.korean_name = %(kw)s OR LOWER(p.name) = LOWER(%(kw)s)) DESC,
+    (p.korean_name ILIKE %(kw)s || '%%' OR p.name ILIKE %(kw)s || '%%') DESC,
+    LENGTH(COALESCE(p.korean_name, p.name))
+LIMIT %(limit)s
+"""
+
+
+_MODERN_WITH_ANCIENT_SQL = """
+SELECT
+    c.id,
+    c.korean_name,
+    c.name,
+    c.types,
+    c.korean_description,
+    c.description,
+    c.parent_ids,
+    COALESCE(
+        (
+            SELECT json_agg(
+                json_build_object(
+                    'place_id', p.id,
+                    'name_ko', p.korean_name,
+                    'name_en', p.name,
+                    'types', p.types,
+                    'bible_references', p.verses,
+                    'identification_names', p.identification_names,
+                    'text', COALESCE(p.korean_description, p.description)
+                )
+            )
+            FROM places p
+            WHERE p.stereo = 'parent'
+              AND p.id = ANY(c.parent_ids)
+        ),
+        '[]'::json
+    ) AS ancient_places
+FROM places c
+WHERE c.stereo = 'child'
+  AND (
+        c.korean_name ILIKE '%%' || %(kw)s || '%%'
+     OR c.name ILIKE '%%' || %(kw)s || '%%'
+  )
+ORDER BY
+    (c.korean_name = %(kw)s OR LOWER(c.name) = LOWER(%(kw)s)) DESC,
+    (c.korean_name ILIKE %(kw)s || '%%' OR c.name ILIKE %(kw)s || '%%') DESC,
+    LENGTH(COALESCE(c.korean_name, c.name))
+LIMIT %(limit)s
+"""
+
+
+def _lookup_ancient_with_modern(name: str, limit: int) -> list[tuple]:
+    with _pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(_ANCIENT_WITH_MODERN_SQL, {"kw": name, "limit": limit})
+            return cur.fetchall()
+
+
+def _lookup_modern_with_ancient(name: str, limit: int) -> list[tuple]:
+    with _pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(_MODERN_WITH_ANCIENT_SQL, {"kw": name, "limit": limit})
+            return cur.fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Tools — 기본 이름 검색 (고대 / 현대)
+# ---------------------------------------------------------------------------
 @tool
 def search_ancient_places(
-    keywords: list[str],
-    top_k_per_keyword: int = 3,
+    names: list[str],
+    top_k_per_name: int = 3,
 ) -> list[PlaceSearchResult]:
-    """고대 성경 장소 이름 키워드 목록으로 지명 데이터를 조회합니다.
+    """고대 성경 장소 이름 목록으로 지명 데이터를 조회합니다.
 
-    각 키워드에 대해 Postgres `places` 테이블(stereo='parent')에서
-    korean_name/name의 contains 매칭(ILIKE %kw%)으로 조회합니다.
-    disambiguation 접미(예: "Bethlehem 1", "베들레헴 1 (유다)")도 자동으로 매칭됩니다.
+    각 이름에 대해 Postgres `places` 테이블(stereo='parent')에서
+    korean_name/name 의 contains 매칭(ILIKE %name%)으로 조회합니다.
+    disambiguation 접미(예: "Bethlehem 1", "베들레헴 1 (유다)")도 자동 매칭.
 
-    **중요: keywords는 반드시 영어 성경 표준 표기로만 넘겨야 합니다.**
-    한국어(안디옥·구브로 등)나 한국식 음차(안티오크·키프로스 등)는 절대 금지.
-    반드시 영어(Antioch, Cyprus, Bethlehem, Salamis, Paphos, Iconium, Lystra, Derbe 등)로.
-    이유: 한국어 표기는 변형이 많아 매칭 실패율이 높습니다. 영어 표기는 표준화돼 있어
-    안정적으로 매칭됩니다.
+    **중요: names 는 반드시 영어 성경 표준 표기로만 넘겨야 합니다.**
+    한국어·음차(안디옥/안티오크/키프로스 등)는 표기 변형이 많아 실패율이 높음.
+    영어(Antioch, Cyprus, Bethlehem, Salamis 등)를 사용하세요.
 
     Args:
-        keywords: 조회할 고대 성경 지명 이름 목록. **반드시 영어**. 최대 20개까지 처리됩니다.
-        top_k_per_keyword: 키워드별 반환 후보 수. 기본값 3, 1~5 사이로 제한됩니다.
+        names: 조회할 고대 성경 지명 이름 목록. **반드시 영어**. 최대 20개까지 처리.
+        top_k_per_name: 이름별 반환 후보 수. 기본값 3, 1~5 사이 제한.
 
     Returns:
-        고대 지명의 place_id, 한글/영문 이름, 지명 유형, 관련 성경 구절,
+        고대 지명의 place_id, 한/영 이름, 지명 유형, 관련 성경 구절,
         현대 위치 후보 이름(identification_names), 본문 설명.
-        place_id 기준으로 중복은 제거됩니다.
+        place_id 기준 중복 제거.
     """
-    normalized_keywords = [kw.strip() for kw in keywords if kw and kw.strip()]
-
-    if not normalized_keywords:
+    normalized = [n.strip() for n in names if n and n.strip()]
+    if not normalized:
         return []
+    limited = normalized[:20]
+    top_k = max(1, min(top_k_per_name, 5))
 
-    limited_keywords = normalized_keywords[:20]
-    normalized_top_k = max(1, min(top_k_per_keyword, 5))
-
-    seen_ids: set[str] = set()
+    seen: set[str] = set()
     results: list[PlaceSearchResult] = []
-
-    for keyword in limited_keywords:
-        for row in _lookup_by_name(keyword, "parent", normalized_top_k):
+    for name in limited:
+        for row in _lookup_by_name(name, "parent", top_k):
             (
                 place_id,
                 korean_name,
-                name,
+                name_en,
                 types,
                 verses,
                 korean_description,
@@ -312,57 +433,52 @@ def search_ancient_places(
                 identification_names,
                 _parent_ids,
             ) = row
-            if place_id in seen_ids:
+            if place_id in seen:
                 continue
-            seen_ids.add(place_id)
+            seen.add(place_id)
             results.append(
                 PlaceSearchResult(
                     place_id=place_id,
                     name_ko=korean_name,
-                    name_en=name,
+                    name_en=name_en,
                     types=list(types) if types else None,
                     bible_references=list(verses) if verses else None,
                     identification_names=list(identification_names) if identification_names else None,
                     text=korean_description or description,
                 )
             )
-
     return results
 
 
 @tool
-def fetch_modern_places_by_names(
+def search_modern_places(
     names: list[str],
-    top_k_per_name: int = 1,
+    top_k_per_name: int = 3,
 ) -> list[ModernPlaceRecord]:
     """현대 지명 이름 목록으로 현대 지명 레코드를 조회합니다.
 
     각 이름에 대해 Postgres `places` 테이블(stereo='child')에서
-    korean_name/name의 정확·prefix 매칭으로 조회합니다.
-    disambiguation 접미(예: "쿰란 1")도 자동으로 매칭됩니다.
+    korean_name/name 의 contains 매칭(ILIKE %name%)으로 조회합니다.
 
     Args:
-        names: 조회할 현대 지명 이름 목록. 최대 10개까지 처리됩니다.
-        top_k_per_name: 이름별 반환 후보 수. 기본값 1, 1~5 사이로 제한됩니다.
+        names: 조회할 현대 지명 이름 목록. 최대 20개까지 처리.
+        top_k_per_name: 이름별 반환 후보 수. 기본값 3, 1~5 사이 제한.
 
     Returns:
-        현대 지명의 place_id, 한글/영문 이름, 지명 유형,
+        현대 지명의 place_id, 한/영 이름, 지명 유형,
         연관된 고대 성경 장소 ID 목록(parent_ids), 본문 설명.
-        place_id 기준으로 중복은 제거됩니다.
+        place_id 기준 중복 제거.
     """
-    normalized_names = [name.strip() for name in names if name and name.strip()]
-
-    if not normalized_names:
+    normalized = [n.strip() for n in names if n and n.strip()]
+    if not normalized:
         return []
+    limited = normalized[:20]
+    top_k = max(1, min(top_k_per_name, 5))
 
-    limited_names = normalized_names[:10]
-    normalized_top_k = max(1, min(top_k_per_name, 5))
-
-    seen_ids: set[str] = set()
+    seen: set[str] = set()
     records: list[ModernPlaceRecord] = []
-
-    for name in limited_names:
-        for row in _lookup_by_name(name, "child", normalized_top_k):
+    for name in limited:
+        for row in _lookup_by_name(name, "child", top_k):
             (
                 place_id,
                 korean_name,
@@ -374,9 +490,9 @@ def fetch_modern_places_by_names(
                 _identification_names,
                 parent_ids,
             ) = row
-            if place_id in seen_ids:
+            if place_id in seen:
                 continue
-            seen_ids.add(place_id)
+            seen.add(place_id)
             records.append(
                 ModernPlaceRecord(
                     place_id=place_id,
@@ -387,8 +503,129 @@ def fetch_modern_places_by_names(
                     text=korean_description or description,
                 )
             )
-
     return records
+
+
+# ---------------------------------------------------------------------------
+# Tools — JOIN 조회 (한 왕복으로 양방향 record 함께)
+# ---------------------------------------------------------------------------
+@tool
+def search_ancient_with_modern(
+    names: list[str],
+    top_k_per_name: int = 3,
+) -> list[AncientWithModernResult]:
+    """고대 지명 이름으로 조회하되, 각 고대 지명과 연결된 현대 위치 후보 레코드를
+    한 번의 쿼리로 함께 반환합니다.
+
+    "이 고대 지명은 지금 어디에 있어?" 처럼 고대 지명 정보와 현대 위치 후보들을
+    동시에 필요할 때 이 도구 하나로 두 번의 조회를 대체합니다.
+
+    Args:
+        names: 조회할 고대 성경 지명 이름 목록. **반드시 영어**. 최대 20개.
+        top_k_per_name: 이름별 반환 parent 후보 수. 기본값 3, 1~5 제한.
+
+    Returns:
+        각 parent record 필드 + `modern_places` (연결된 child record 목록).
+        place_id 기준 중복 제거.
+    """
+    normalized = [n.strip() for n in names if n and n.strip()]
+    if not normalized:
+        return []
+    limited = normalized[:20]
+    top_k = max(1, min(top_k_per_name, 5))
+
+    seen: set[str] = set()
+    results: list[AncientWithModernResult] = []
+    for name in limited:
+        for row in _lookup_ancient_with_modern(name, top_k):
+            (
+                place_id,
+                korean_name,
+                name_en,
+                types,
+                verses,
+                korean_description,
+                description,
+                identification_names,
+                modern_places_json,
+            ) = row
+            if place_id in seen:
+                continue
+            seen.add(place_id)
+            modern_places = [
+                ModernPlaceRecord(**m) for m in (modern_places_json or [])
+            ]
+            results.append(
+                AncientWithModernResult(
+                    place_id=place_id,
+                    name_ko=korean_name,
+                    name_en=name_en,
+                    types=list(types) if types else None,
+                    bible_references=list(verses) if verses else None,
+                    identification_names=list(identification_names) if identification_names else None,
+                    text=korean_description or description,
+                    modern_places=modern_places,
+                )
+            )
+    return results
+
+
+@tool
+def search_modern_with_ancient(
+    names: list[str],
+    top_k_per_name: int = 3,
+) -> list[ModernWithAncientResult]:
+    """현대 지명 이름으로 조회하되, 각 현대 지명과 연결된 고대 성경 지명 후보 레코드를
+    한 번의 쿼리로 함께 반환합니다.
+
+    "이 현대 지명이 성경 어디에 해당해?" 처럼 현대 지명 정보와 고대 후보들을
+    동시에 필요할 때 이 도구 하나로 두 번의 조회를 대체합니다.
+
+    Args:
+        names: 조회할 현대 지명 이름 목록. 최대 20개.
+        top_k_per_name: 이름별 반환 child 후보 수. 기본값 3, 1~5 제한.
+
+    Returns:
+        각 child record 필드 + `ancient_places` (연결된 parent record 목록).
+        place_id 기준 중복 제거.
+    """
+    normalized = [n.strip() for n in names if n and n.strip()]
+    if not normalized:
+        return []
+    limited = normalized[:20]
+    top_k = max(1, min(top_k_per_name, 5))
+
+    seen: set[str] = set()
+    results: list[ModernWithAncientResult] = []
+    for name in limited:
+        for row in _lookup_modern_with_ancient(name, top_k):
+            (
+                place_id,
+                korean_name,
+                name_en,
+                types,
+                korean_description,
+                description,
+                _parent_ids,
+                ancient_places_json,
+            ) = row
+            if place_id in seen:
+                continue
+            seen.add(place_id)
+            ancient_places = [
+                PlaceSearchResult(**p) for p in (ancient_places_json or [])
+            ]
+            results.append(
+                ModernWithAncientResult(
+                    place_id=place_id,
+                    name_ko=korean_name,
+                    name_en=name_en,
+                    types=list(types) if types else None,
+                    text=korean_description or description,
+                    ancient_places=ancient_places,
+                )
+            )
+    return results
 
 
 @tool
@@ -433,11 +670,15 @@ def ancient_keyword_search(query: str) -> list[str]:
 __all__ = [
     "PlaceSearchResult",
     "ModernPlaceRecord",
+    "AncientWithModernResult",
+    "ModernWithAncientResult",
     "KeywordResult",
     "JourneyRouteResult",
     "JourneyDescriptionResult",
     "search_ancient_places",
-    "fetch_modern_places_by_names",
+    "search_modern_places",
+    "search_ancient_with_modern",
+    "search_modern_with_ancient",
     "journey_route_search",
     "journey_description_search",
     "ancient_keyword_search",
