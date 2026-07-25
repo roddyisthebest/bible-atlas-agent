@@ -65,13 +65,14 @@ def _stream_graph(query: str):
     final: dict = {}
     try:
         for update in graph.stream(initial_state, stream_mode="updates"):
-            # update is {node_name: delta}. delta may include LangChain messages.
-            (node_name, delta), = update.items()
-            yield _sse_event("node", {"node": node_name, "update": delta})
-            if delta:
-                for key in ("answer", "place_id_map", "recommended_questions"):
-                    if key in delta:
-                        final[key] = delta[key]
+            # update is {node_name: delta, ...}. Usually one key, but iterate
+            # defensively in case a future step fans out.
+            for node_name, delta in update.items():
+                yield _sse_event("node", {"node": node_name, "update": delta})
+                if delta:
+                    for key in ("answer", "place_id_map", "recommended_questions"):
+                        if key in delta:
+                            final[key] = delta[key]
     except Exception as exc:  # noqa: BLE001 — user-facing error stream
         logger.exception("graph.stream failed")
         yield _sse_event("error", {"detail": str(exc)})
@@ -108,6 +109,10 @@ def invoke(request: InvokeRequest) -> InvokeResponse:
     )
 
 
+# Note: if the client disconnects mid-stream, the in-flight graph.stream()
+# step continues to completion in the threadpool (sync generator limitation).
+# The generator is then abandoned — no leaks, but the current LLM/DB call
+# is not cancelled. Revisit if we move to an async graph runtime.
 @app.post("/stream", dependencies=[Depends(require_api_key)])
 def stream(request: InvokeRequest) -> StreamingResponse:
     return StreamingResponse(
