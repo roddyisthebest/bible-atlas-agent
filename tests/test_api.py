@@ -218,3 +218,11 @@ def test_stream_emits_error_event_on_graph_exception(client, api_headers, monkey
     assert events[0]["event"] == "node"
     assert events[-1]["event"] == "error"
     assert "kaboom" in events[-1]["data"]["detail"]
+
+
+def test_cors_header_present_on_actual_request(client):
+    """Preflight OPTIONS is covered separately; verify ACAO also appears on
+    real requests (regression guard for future middleware config changes)."""
+    response = client.get("/health", headers={"Origin": "http://localhost:3000"})
+    assert response.status_code == 200
+    assert response.headers.get("access-control-allow-origin") == "*"
