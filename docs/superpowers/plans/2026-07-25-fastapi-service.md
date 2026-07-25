@@ -33,20 +33,24 @@ All handler logic, schemas, and middleware live in one file (per spec). If `api.
 - Modify: `.env.example`
 - Modify: `.env` (local only; do NOT commit)
 
-- [ ] **Step 1: Add FastAPI + uvicorn to `pyproject.toml`**
+- [ ] **Step 1: Add FastAPI + uvicorn + httpx to `pyproject.toml`**
 
 Edit the `dependencies = [...]` array. Insert alphabetically near existing entries:
 
 ```toml
     "fastapi>=0.115.0",
+    "httpx>=0.27.0",
     ...
     "uvicorn[standard]>=0.32.0",
 ```
 
+(`httpx` is required by FastAPI's `TestClient` and is NOT a transitive dep of
+`fastapi` alone — must be listed explicitly.)
+
 - [ ] **Step 2: Sync deps**
 
 Run: `uv sync`
-Expected: resolves and installs `fastapi`, `uvicorn`, `starlette`, `httpx` (transitive via TestClient), no errors.
+Expected: resolves and installs `fastapi`, `uvicorn`, `starlette`, `httpx`, no errors.
 
 - [ ] **Step 3: Add `API_KEY` line to `.env.example`**
 
