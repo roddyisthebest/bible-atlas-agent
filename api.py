@@ -13,6 +13,7 @@ from typing import Annotated
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.load import dumps as lc_dumps
 from langchain_core.messages import HumanMessage
@@ -25,6 +26,15 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="bible-atlas-agent")
+
+# TODO: restrict for prod. Local dev opens everything.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.exception_handler(Exception)

@@ -183,6 +183,22 @@ def test_stream_emits_node_events_then_done(client, api_headers, fake_graph):
     assert events[-1]["data"]["recommended_questions"] == []
 
 
+def test_cors_preflight_allows_frontend(client):
+    response = client.options(
+        "/invoke",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "X-API-Key,Content-Type",
+        },
+    )
+    assert response.status_code == 200
+    # When allow_credentials=True, Starlette reflects the request origin instead
+    # of "*" (per the CORS spec, credentials + wildcard is disallowed).
+    acao = response.headers.get("access-control-allow-origin")
+    assert acao in ("*", "http://localhost:3000")
+
+
 def test_stream_emits_error_event_on_graph_exception(client, api_headers, monkeypatch):
     def boom(state, stream_mode):
         yield {"router": None}
