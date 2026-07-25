@@ -13,7 +13,8 @@ from typing import Annotated
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from langchain_core.load import dumps as lc_dumps
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 
@@ -50,6 +51,40 @@ class InvokeResponse(BaseModel):
     recommended_questions: list[str] = Field(default_factory=list)
 
 
+def _sse_event(event: str, data: object) -> str:
+    """Serialize a single SSE event. LangChain objects survive via lc_dumps."""
+    payload = lc_dumps(data)
+    return f"event: {event}\ndata: {payload}\n\n"
+
+
+def _stream_graph(query: str):
+    initial_state = {
+        "query": query,
+        "messages": [HumanMessage(content=query)],
+    }
+    final: dict = {}
+    try:
+        for update in graph.stream(initial_state, stream_mode="updates"):
+            # update is {node_name: delta}. delta may include LangChain messages.
+            (node_name, delta), = update.items()
+            yield _sse_event("node", {"node": node_name, "update": delta})
+            if delta:
+                for key in ("answer", "place_id_map", "recommended_questions"):
+                    if key in delta:
+                        final[key] = delta[key]
+    except Exception as exc:  # noqa: BLE001 — user-facing error stream
+        logger.exception("graph.stream failed")
+        yield _sse_event("error", {"detail": str(exc)})
+        return
+
+    done_payload = {
+        "answer": final.get("answer", ""),
+        "place_id_map": final.get("place_id_map") or {},
+        "recommended_questions": final.get("recommended_questions") or [],
+    }
+    yield _sse_event("done", done_payload)
+
+
 @app.get("/health")
 def health() -> dict:
     return {"ok": True}
@@ -70,4 +105,16 @@ def invoke(request: InvokeRequest) -> InvokeResponse:
         answer=result.get("answer", ""),
         place_id_map=result.get("place_id_map") or {},
         recommended_questions=result.get("recommended_questions") or [],
+    )
+
+
+@app.post("/stream", dependencies=[Depends(require_api_key)])
+def stream(request: InvokeRequest) -> StreamingResponse:
+    return StreamingResponse(
+        _stream_graph(request.query),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )

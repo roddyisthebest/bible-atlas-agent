@@ -134,3 +134,74 @@ def test_invoke_graph_exception_returns_500_with_detail(client, api_headers, mon
     )
     assert response.status_code == 500
     assert response.json() == {"detail": "db offline"}
+
+
+def _parse_sse(body: str) -> list[dict]:
+    """Minimal SSE parser: split on blank lines, extract event + data."""
+    import json
+    events = []
+    for chunk in body.strip().split("\n\n"):
+        event_type = None
+        data = None
+        for line in chunk.splitlines():
+            if line.startswith("event:"):
+                event_type = line[len("event:"):].strip()
+            elif line.startswith("data:"):
+                data = json.loads(line[len("data:"):].strip())
+        events.append({"event": event_type, "data": data})
+    return events
+
+
+def test_stream_without_key_returns_401(client):
+    response = client.post("/stream", json={"query": "hi"})
+    assert response.status_code == 401
+
+
+def test_stream_emits_node_events_then_done(client, api_headers, fake_graph):
+    fake_graph(stream_updates=[
+        {"router": None},
+        {"place_agent": {"messages": []}},
+        {"format": {"answer": "hi", "place_id_map": {"베들레헴": ["a112427"]}}},
+    ])
+
+    with client.stream(
+        "POST",
+        "/stream",
+        json={"query": "hi"},
+        headers=api_headers,
+    ) as response:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        body = "".join(response.iter_text())
+
+    events = _parse_sse(body)
+    # 3 node events + 1 done event
+    assert [e["event"] for e in events] == ["node", "node", "node", "done"]
+    assert events[0]["data"] == {"node": "router", "update": None}
+    assert events[-1]["data"]["answer"] == "hi"
+    assert events[-1]["data"]["place_id_map"] == {"베들레헴": ["a112427"]}
+    assert events[-1]["data"]["recommended_questions"] == []
+
+
+def test_stream_emits_error_event_on_graph_exception(client, api_headers, monkeypatch):
+    def boom(state, stream_mode):
+        yield {"router": None}
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(
+        "api.graph",
+        SimpleNamespace(invoke=lambda s: {}, stream=boom),
+    )
+
+    with client.stream(
+        "POST",
+        "/stream",
+        json={"query": "hi"},
+        headers=api_headers,
+    ) as response:
+        body = "".join(response.iter_text())
+
+    events = _parse_sse(body)
+    assert events[0]["event"] == "node"
+    assert events[-1]["event"] == "error"
+    assert "kaboom" in events[-1]["data"]["detail"]
