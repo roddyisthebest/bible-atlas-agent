@@ -49,11 +49,12 @@ def test_invoke_with_wrong_key_returns_401(client):
     assert response.status_code == 401
 
 
-def test_invoke_with_valid_key_reaches_handler(client, api_headers):
-    # We haven't wired the graph yet, so the endpoint returns a stub.
-    # This test only proves auth passes; response shape is tested in Task 4.
+def test_invoke_with_valid_key_reaches_handler(client, api_headers, fake_graph):
+    # Prove auth passes and the handler reaches graph.invoke. Response shape
+    # is separately tested by test_invoke_returns_response_shape.
+    fake_graph(invoke_result={"answer": "ok"})
     response = client.post("/invoke", json={"query": "hi"}, headers=api_headers)
-    assert response.status_code != 401
+    assert response.status_code == 200
 
 
 @pytest.fixture
