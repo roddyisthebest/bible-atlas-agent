@@ -28,10 +28,12 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="bible-atlas-agent")
 
 # TODO: restrict for prod. Local dev opens everything.
+# X-API-Key auth uses a custom request header, not cookies, so
+# allow_credentials is left off — this lets the middleware return
+# "*" as the ACAO header (Fetch spec forbids "*" with credentials).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )

@@ -193,10 +193,7 @@ def test_cors_preflight_allows_frontend(client):
         },
     )
     assert response.status_code == 200
-    # When allow_credentials=True, Starlette reflects the request origin instead
-    # of "*" (per the CORS spec, credentials + wildcard is disallowed).
-    acao = response.headers.get("access-control-allow-origin")
-    assert acao in ("*", "http://localhost:3000")
+    assert response.headers.get("access-control-allow-origin") == "*"
 
 
 def test_stream_emits_error_event_on_graph_exception(client, api_headers, monkeypatch):
