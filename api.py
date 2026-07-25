@@ -22,7 +22,8 @@ app = FastAPI(title="bible-atlas-agent")
 def require_api_key(
     x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
 ) -> None:
-    if x_api_key != os.environ.get("API_KEY"):
+    expected = os.environ.get("API_KEY")
+    if not expected or x_api_key != expected:
         raise HTTPException(status_code=401, detail="invalid api key")
 
 
