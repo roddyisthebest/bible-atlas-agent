@@ -378,18 +378,32 @@ def rewrite(state: AgentState) -> dict:
 # format (place_id 매핑 추출 + 답변 확정)
 # ---------------------------------------------------------------------------
 _TRAILING_DIGITS_RE = re.compile(r"\s*\d+$")
+_TRAILING_PAREN_RE = re.compile(r"\s*\([^)]*\)\s*$")
 
 
 def _normalize_place_name(name: str) -> str:
-    """DB 동명이인 구분용 접미 숫자를 제거해 base name 을 만든다.
+    """DB 동명이인 구분자(접미 숫자 + 괄호 주석)를 제거해 base name 을 만든다.
 
-    예) "안디옥1" → "안디옥", "안디옥 2" → "안디옥", "Antioch3" → "Antioch".
-    이렇게 하면 (a) 고대·현대가 같은 이름을 가질 때, (b) DB 가 숫자 접미로
+    예)
+        "안디옥1"                → "안디옥"
+        "안디옥 2"               → "안디옥"
+        "Antioch3"              → "Antioch"
+        "베들레헴 1 (유다)"       → "베들레헴"
+        "베들레헴 (스블론)"       → "베들레헴"
+        "Bethlehem 2 (Zebulun)" → "Bethlehem"
+
+    이렇게 하면 (a) 고대·현대가 같은 이름을 가질 때, (b) DB 가 숫자·괄호로
     동명을 구분해 저장했을 때, place_id_map 이 base name 하나의 key 로
-    모든 후보 id 를 버킷팅한다. 이름 전체가 숫자면 원본 유지.
+    모든 후보 id 를 버킷팅한다. 결과가 빈 문자열이면 원본 유지.
     """
-    stripped = _TRAILING_DIGITS_RE.sub("", name).rstrip()
-    return stripped or name
+    prev = None
+    curr = name
+    # 괄호 주석과 숫자 접미가 어느 순서로 붙어 있어도 반복해서 벗겨낸다.
+    while prev != curr:
+        prev = curr
+        curr = _TRAILING_PAREN_RE.sub("", curr).rstrip()
+        curr = _TRAILING_DIGITS_RE.sub("", curr).rstrip()
+    return curr or name
 
 
 def _extract_place_refs(tool_message_content: str) -> dict[str, list[str]]:
