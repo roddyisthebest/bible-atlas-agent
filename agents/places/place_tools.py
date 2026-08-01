@@ -17,10 +17,26 @@ POSTGRES_URL = os.environ["POSTGRES_URL"]
 # ---------------------------------------------------------------------------
 # 프로세스당 pool 1개. 각 tool 호출은 pool.connection()으로 짧게 borrow.
 # min_size/max_size는 소규모 트래픽 기준. 필요 시 상향.
+#
+# managed DB (Railway/Neon/Supabase 등) 는 유지보수·idle timeout·admin
+# terminate 로 pool 안 idle 커넥션을 몰래 죽인다. 다음 checkout 이 죽은
+# 커넥션을 잡으면 "terminating connection due to administration command"
+# (SQLSTATE 57P01) 가 사용자에게 그대로 노출됨.
+#
+# 방어:
+#   - check=check_connection: 넘겨주기 직전에 짧은 ping 으로 살아있는지
+#     검증, 죽었으면 pool 이 자동으로 교체.
+#   - max_idle=300: 5분 이상 놀린 커넥션은 서버 idle timeout 걸리기
+#     전에 미리 축출.
+#   - max_lifetime=1800: 30분마다 강제 재생성, 장수 커넥션이 서버 재시작
+#     시점을 넘어가는 상황 방지.
 _pool = ConnectionPool(
     conninfo=POSTGRES_URL,
     min_size=1,
     max_size=5,
+    max_idle=300,
+    max_lifetime=1800,
+    check=ConnectionPool.check_connection,
     open=True,   # 모듈 로드 시 즉시 열기
 )
 
