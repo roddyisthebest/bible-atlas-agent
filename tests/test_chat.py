@@ -13,6 +13,7 @@ from agents.places.chat import (
     THRESHOLD,
     ChatMessage,
     build_context,
+    finalize_turn,
     run_turn,
     should_summarize,
     summarize,
@@ -227,3 +228,61 @@ def test_run_turn_defaults_missing_optional_fields_to_empty():
     result = run_turn(query="q", graph=graph)
     assert result.place_id_map == {}
     assert result.recommended_questions == []
+
+
+# ---------------------------------------------------------------------------
+# finalize_turn: shared post-graph bookkeeping (used by run_turn + /stream)
+# ---------------------------------------------------------------------------
+def test_finalize_turn_appends_user_and_assistant_pair():
+    prior = [ChatMessage(role="user", content="q1"), ChatMessage(role="assistant", content="a1")]
+    result = finalize_turn(
+        query="q2",
+        summary=None,
+        messages=prior,
+        answer="a2",
+        place_id_map={"베들레헴": ["a1"]},
+        recommended_questions=[],
+    )
+    assert result.answer == "a2"
+    assert result.summary is None
+    assert result.messages == [
+        ChatMessage(role="user", content="q1"),
+        ChatMessage(role="assistant", content="a1"),
+        ChatMessage(role="user", content="q2"),
+        ChatMessage(role="assistant", content="a2"),
+    ]
+    assert result.place_id_map == {"베들레헴": ["a1"]}
+
+
+def test_finalize_turn_defaults_missing_optionals():
+    result = finalize_turn(
+        query="q", summary=None, messages=[], answer="a",
+    )
+    assert result.place_id_map == {}
+    assert result.recommended_questions == []
+
+
+def test_finalize_turn_triggers_summarize_and_resets_messages():
+    # Fill just below threshold so the (user, assistant) pair pushes over.
+    prior = [
+        ChatMessage(role="user" if i % 2 == 0 else "assistant", content=f"m{i}")
+        for i in range(THRESHOLD - 1)
+    ]
+    summarize_calls: list[dict] = []
+
+    def fake_summarize(*, prev_summary, messages):
+        summarize_calls.append({"prev_summary": prev_summary, "messages": messages})
+        return "요약본"
+
+    result = finalize_turn(
+        query="q_last",
+        summary="옛 요약",
+        messages=prior,
+        answer="a_last",
+        summarize_fn=fake_summarize,
+    )
+    assert result.summary == "요약본"
+    assert result.messages == []
+    assert len(summarize_calls) == 1
+    assert summarize_calls[0]["prev_summary"] == "옛 요약"
+    assert summarize_calls[0]["messages"][-1] == ChatMessage(role="assistant", content="a_last")

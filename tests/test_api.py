@@ -101,11 +101,74 @@ def test_invoke_missing_optional_fields_defaults_to_empty(client, api_headers, f
     )
     assert response.status_code == 200
     body = response.json()
+    # First turn: server echoes (user, assistant) pair in messages, summary null.
     assert body == {
         "answer": "just an answer",
         "place_id_map": {},
         "recommended_questions": [],
+        "summary": None,
+        "messages": [
+            {"role": "user", "content": "성령이란?"},
+            {"role": "assistant", "content": "just an answer"},
+        ],
     }
+
+
+def test_invoke_forwards_prior_summary_and_messages_into_graph_context(
+    client, api_headers, fake_graph
+):
+    fake = fake_graph(invoke_result={"answer": "a2"})
+    captured: dict = {}
+    fake.invoke = lambda state: (captured.update({"state": state}) or {"answer": "a2"})
+    # fake_graph fixture sets api.graph; overwrite the invoke to capture.
+    import api
+    api.graph = fake
+
+    response = client.post(
+        "/invoke",
+        json={
+            "query": "다음은?",
+            "summary": "지난 대화 요지",
+            "messages": [
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": "a1"},
+            ],
+        },
+        headers=api_headers,
+    )
+    assert response.status_code == 200
+
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+    ctx = captured["state"]["messages"]
+    # SystemMessage(summary) + HumanMessage(q1) + AIMessage(a1) + HumanMessage(다음은?)
+    assert [type(m) for m in ctx] == [SystemMessage, HumanMessage, AIMessage, HumanMessage]
+    assert "지난 대화 요지" in ctx[0].content
+    assert ctx[-1].content == "다음은?"
+
+
+def test_invoke_returns_appended_messages_carrying_prior_history(
+    client, api_headers, fake_graph
+):
+    fake_graph(invoke_result={"answer": "a2"})
+    response = client.post(
+        "/invoke",
+        json={
+            "query": "q2",
+            "messages": [
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": "a1"},
+            ],
+        },
+        headers=api_headers,
+    )
+    body = response.json()
+    assert body["messages"] == [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "a2"},
+    ]
+    assert body["summary"] is None
 
 
 def test_invoke_empty_query_returns_422(client, api_headers):
@@ -218,6 +281,122 @@ def test_stream_emits_error_event_on_graph_exception(client, api_headers, monkey
     assert events[0]["event"] == "node"
     assert events[-1]["event"] == "error"
     assert "kaboom" in events[-1]["data"]["detail"]
+
+
+def test_stream_done_payload_includes_summary_and_messages(client, api_headers, fake_graph):
+    fake_graph(stream_updates=[
+        {"format": {"answer": "hi", "place_id_map": {}}},
+    ])
+
+    with client.stream(
+        "POST", "/stream", json={"query": "hi"}, headers=api_headers,
+    ) as response:
+        body = "".join(response.iter_text())
+
+    events = _parse_sse(body)
+    done = events[-1]
+    assert done["event"] == "done"
+    # First turn: server echoes (user, assistant) pair; summary null.
+    assert done["data"]["summary"] is None
+    assert done["data"]["messages"] == [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hi"},
+    ]
+
+
+def test_stream_forwards_prior_summary_and_messages_into_graph_context(
+    client, api_headers, monkeypatch
+):
+    captured: dict = {}
+
+    def _stream(state, stream_mode):
+        captured["state"] = state
+        yield {"format": {"answer": "a2"}}
+
+    monkeypatch.setattr(
+        "api.graph",
+        SimpleNamespace(invoke=lambda s: {}, stream=_stream),
+    )
+
+    with client.stream(
+        "POST",
+        "/stream",
+        json={
+            "query": "다음은?",
+            "summary": "지난 대화 요지",
+            "messages": [
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": "a1"},
+            ],
+        },
+        headers=api_headers,
+    ) as response:
+        # Drain the stream so the generator runs to completion (finalize_turn
+        # etc). Then assert on captured state.
+        _ = "".join(response.iter_text())
+
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+    ctx = captured["state"]["messages"]
+    assert [type(m) for m in ctx] == [SystemMessage, HumanMessage, AIMessage, HumanMessage]
+    assert "지난 대화 요지" in ctx[0].content
+    assert ctx[-1].content == "다음은?"
+
+
+def test_stream_done_carries_appended_prior_messages(client, api_headers, fake_graph):
+    fake_graph(stream_updates=[{"format": {"answer": "a2"}}])
+
+    with client.stream(
+        "POST",
+        "/stream",
+        json={
+            "query": "q2",
+            "messages": [
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": "a1"},
+            ],
+        },
+        headers=api_headers,
+    ) as response:
+        body = "".join(response.iter_text())
+
+    done = _parse_sse(body)[-1]
+    assert done["data"]["messages"] == [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "a2"},
+    ]
+    assert done["data"]["summary"] is None
+
+
+def test_stream_done_triggers_summary_and_resets_messages_over_threshold(
+    client, api_headers, fake_graph, monkeypatch
+):
+    from agents.places.chat import THRESHOLD
+
+    fake_graph(stream_updates=[{"format": {"answer": "a_last"}}])
+    monkeypatch.setattr(
+        "agents.places.chat.summarize",
+        lambda *, prev_summary, messages: "요약본",
+    )
+    # (THRESHOLD - 1) prior msgs + this turn's 2 = THRESHOLD + 1 → over threshold.
+    prior = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"}
+        for i in range(THRESHOLD - 1)
+    ]
+
+    with client.stream(
+        "POST",
+        "/stream",
+        json={"query": "q_last", "summary": "옛 요약", "messages": prior},
+        headers=api_headers,
+    ) as response:
+        body = "".join(response.iter_text())
+
+    done = _parse_sse(body)[-1]
+    assert done["event"] == "done"
+    assert done["data"]["summary"] == "요약본"
+    assert done["data"]["messages"] == []
 
 
 def test_cors_header_present_on_actual_request(client):
