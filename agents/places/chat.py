@@ -82,31 +82,25 @@ def _format_messages_for_summary(messages: list[ChatMessage]) -> str:
     return "\n".join(f"{m.role}: {m.content}" for m in messages)
 
 
-def run_turn(
-    query: str,
-    summary: str | None = None,
-    messages: list[ChatMessage] | None = None,
+def finalize_turn(
     *,
-    graph=None,
+    query: str,
+    summary: str | None,
+    messages: list[ChatMessage],
+    answer: str,
+    place_id_map: dict[str, list[str]] | None = None,
+    recommended_questions: list[str] | None = None,
     summarize_fn: Callable[..., str] | None = None,
 ) -> ChatTurnResult:
-    """Run one chat turn: build context → invoke graph → maybe summarize.
+    """Post-graph bookkeeping shared by run_turn (graph.invoke) and streaming
+    callers that drive graph.stream themselves.
 
-    `graph` and `summarize_fn` are injectable for tests. Defaults resolve
-    lazily to the real workflow graph and the module-level `summarize`.
+    Appends (user query, assistant answer) to messages, and summarizes+resets
+    when the running count exceeds THRESHOLD.
     """
-    messages = messages or []
-    if graph is None:
-        from agents.places.workflow import graph as default_graph
-        graph = default_graph
     if summarize_fn is None:
         summarize_fn = summarize
 
-    ctx_messages = build_context(summary=summary, messages=messages, query=query)
-    state = {"query": query, "messages": ctx_messages}
-    result = graph.invoke(state)
-
-    answer = result.get("answer", "")
     new_messages = list(messages) + [
         ChatMessage(role="user", content=query),
         ChatMessage(role="assistant", content=answer),
@@ -118,10 +112,42 @@ def run_turn(
 
     return ChatTurnResult(
         answer=answer,
-        place_id_map=result.get("place_id_map") or {},
-        recommended_questions=result.get("recommended_questions") or [],
+        place_id_map=place_id_map or {},
+        recommended_questions=recommended_questions or [],
         summary=new_summary,
         messages=new_messages,
+    )
+
+
+def run_turn(
+    query: str,
+    summary: str | None = None,
+    messages: list[ChatMessage] | None = None,
+    *,
+    graph=None,
+    summarize_fn: Callable[..., str] | None = None,
+) -> ChatTurnResult:
+    """Run one chat turn: build context → invoke graph → finalize.
+
+    `graph` and `summarize_fn` are injectable for tests. Defaults resolve
+    lazily to the real workflow graph and the module-level `summarize`.
+    """
+    messages = messages or []
+    if graph is None:
+        from agents.places.workflow import graph as default_graph
+        graph = default_graph
+
+    ctx_messages = build_context(summary=summary, messages=messages, query=query)
+    result = graph.invoke({"query": query, "messages": ctx_messages})
+
+    return finalize_turn(
+        query=query,
+        summary=summary,
+        messages=messages,
+        answer=result.get("answer", ""),
+        place_id_map=result.get("place_id_map"),
+        recommended_questions=result.get("recommended_questions"),
+        summarize_fn=summarize_fn,
     )
 
 
