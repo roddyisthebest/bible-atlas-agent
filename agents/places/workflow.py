@@ -167,8 +167,17 @@ def router(state: AgentState) -> str:
 # ---------------------------------------------------------------------------
 # Shared prompt fragments
 # ---------------------------------------------------------------------------
-# answer 생성 노드 공통 출력 형식 규칙. 프론트가 문단 단위로 렌더할 수 있도록
-# 논리 단위 사이를 반드시 \n\n 으로 분리하도록 강제한다.
+# 모든 answer 생성 노드에 공통 주입되는 규칙 세트. 각 프롬프트 뒤에
+# concat 해서 언어/문단 형식을 강제한다.
+_LANGUAGE_RULE = (
+    "**언어 규칙**\n"
+    "- 사용자 질문 언어와 반드시 동일한 언어로 답변합니다. "
+    "한국어 질문 → 한국어, 영어 질문 → 영어. 다른 언어로 답하지 않습니다.\n"
+    "- 한국어일 때만 존댓말(-습니다체)을 사용합니다. 반말·평서체(-다) 금지.\n"
+    "- 영어일 때는 정중한(polite) 톤을 유지합니다."
+)
+
+# 프론트가 문단 단위로 렌더할 수 있도록 논리 단위 사이를 \n\n 으로 분리.
 _FORMAT_RULE = (
     "**출력 형식 규칙**\n"
     "- 답변이 논리적으로 둘 이상의 단위로 나뉘면 각 단위 사이는 반드시 "
@@ -176,6 +185,9 @@ _FORMAT_RULE = (
     "- 한 문단으로 충분한 짧은 답은 그대로 한 문단으로 유지합니다.\n"
     "- 문단 내부에서 임의 줄바꿈은 사용하지 않습니다."
 )
+
+# 각 프롬프트에 한 번에 붙일 수 있게 미리 조립.
+_COMMON_ANSWER_RULES = _LANGUAGE_RULE + "\n\n" + _FORMAT_RULE
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +202,7 @@ PLACE_AGENT_SYSTEM = _PRD_PATH.read_text(encoding="utf-8")
 _place_agent_runnable = create_agent(
     model=llm,
     tools=tool_list,
-    system_prompt=PLACE_AGENT_SYSTEM + "\n\n" + _FORMAT_RULE,
+    system_prompt=PLACE_AGENT_SYSTEM + "\n\n" + _COMMON_ANSWER_RULES,
 )
 
 
@@ -207,12 +219,11 @@ def place_agent(state: AgentState) -> dict:
 bible_general_agent_prompt = PromptTemplate.from_template(
     """성경 질문 응답 도우미.
 규칙:
-- 한국어면 반드시 존댓말(-습니다체). 반말·평서체(-다) 금지.
 - 3~5문장 이내, 성경 본문·인물·사건·신학에 한정.
-- 확신 없으면 "성경에서 명확히 다루지 않는다".
+- 확신 없으면 "성경에서 명확히 다루지 않는다" (영어면 "the Bible does not clearly address this").
 - 서두·맺음말·이모지 금지.
 
-""" + _FORMAT_RULE + """
+""" + _COMMON_ANSWER_RULES + """
 
 질문: {query}
 """
@@ -231,43 +242,63 @@ def bible_general_agent(state: AgentState) -> dict:
 class NonBibleResponse(BaseModel):
     answer: str = Field(
         description=(
-            "성경 도메인 밖 질문에 대한 안내 답변. 3~5문장, "
-            "문단 구분을 위해 반드시 개행 두 번(\\n\\n) 포함. "
-            "사용자 질문 언어와 동일."
+            "Polite off-topic reply. 3~5 sentences. MUST include `\\n\\n` "
+            "between logical paragraphs. Language MUST match the user's "
+            "query language (Korean query -> Korean answer, English query "
+            "-> English answer)."
         )
     )
     recommended_questions: list[str] = Field(
         default_factory=list,
         max_length=3,
-        description="대체 질문 3개. 원 질문 맥락과 연결지어 성경 지리·지명 예시 질문 형태로.",
+        description=(
+            "Exactly 3 example biblical-geography questions. Language MUST "
+            "match the user's query language."
+        ),
     )
 
 
 non_bible_reject_prompt = ChatPromptTemplate.from_messages([
     (
         "system",
-        """당신은 성경 지리·지명·여정 전문 도우미입니다.
-사용자의 이번 질문은 이 도메인 밖입니다. 아래 두 필드를 채워 반환하세요.
+        _COMMON_ANSWER_RULES + """
 
-[answer 작성 규칙]
-- 총 3~5문장.
-- 다음 세 부분으로 구성하고, **각 부분 사이는 반드시 개행 두 번(`\\n\\n`)** 으로 문단 구분:
-    1) 사용자의 질문 의도를 한 문장으로 짚어 공감.
-    2) 본 서비스는 성경의 지명·지리·여정에 특화되어 있어 해당 주제는 상세히 답하기 어렵다는 안내.
-    3) 관련해서 도와드릴 수 있는 방향(성경 지리·여정 등)으로 자연스럽게 연결하는 한 문장.
-- 한국어면 반드시 존댓말(-습니다체). 반말·평서체(-다) 금지.
-- 사과의 반복, 이모지, 과장 표현 금지.
+You are a specialist assistant for **biblical places, geography, and journeys**.
+The user's current question is outside this domain. Fill the two fields below and return.
 
-[recommended_questions 작성 규칙]
-- 성경 지리·지명 예시 질문 정확히 3개.
-- 원 질문의 맥락(지역·인물·시대·주제 등)과 조금이라도 연결 가능하면 그 방향으로 제시.
-- 언어는 사용자 질문 언어(한국어/영어)와 동일.""",
+**CRITICAL: The [Language Rule] above is absolute.** Detect the user's query language
+and write EVERY field (answer + every recommended_questions entry) in that same
+language. Korean query → all Korean output. English query → all English output.
+Do NOT default to Korean. Do NOT mix languages.
+
+[answer content]
+- Exactly 3–5 sentences, structured as three parts separated by `\\n\\n`:
+    1) One sentence that empathizes with the user's intent.
+    2) One sentence explaining this service is specialized for biblical
+       places / geography / journeys and cannot address this topic in detail.
+    3) One sentence pivoting toward biblical-geography topics we can help with.
+- No repeated apologies, no emojis, no overstatement.
+
+[recommended_questions content]
+- Exactly 3 example questions about biblical places or geography.
+- If the original question has any thread (region, person, era, theme) that can
+  bridge into biblical geography, bias the examples toward that thread.
+- Each example question MUST be in the same language as the user's query.
+
+[Language detection examples — follow this pattern strictly]
+- Query "What's your favorite movie?" → detect language = English → answer in English, recommended_questions in English.
+- Query "where is the money" → English → English output.
+- Query "오늘 날씨 어때?" → Korean → Korean output.
+- Query "돈 어디있어" → Korean → Korean output.
+Detect the query language BEFORE writing anything, then commit to that language for every field.""",
     ),
-    ("user", "질문: {query}"),
+    ("user", "User query (detect language, respond in that same language): {query}"),
 ])
 
+# nano 모델은 다국어 + 문단 형식 같은 복합 지시를 잘 못 따라가서
+# mini 로 승급. 구조화 출력이라 비용 여전히 작음.
 non_bible_reject_chain = (
-    non_bible_reject_prompt | nano_llm.with_structured_output(NonBibleResponse)
+    non_bible_reject_prompt | mini_llm.with_structured_output(NonBibleResponse)
 )
 
 
@@ -355,14 +386,13 @@ rewrite_prompt = ChatPromptTemplate.from_messages([
     (
         "system",
         """성경 지리·지명 전문가. DB 결과 부족해 사전 지식만으로 답.
-- 한국어면 반드시 존댓말(-습니다체). 반말·평서체(-다) 금지.
 - 성경 본문·전통·널리 알려진 학설 수준.
-- 확실한 사실은 단정, 이견 있으면 "학자들 사이 의견이 갈리지만 흔히…" 첨언.
+- 확실한 사실은 단정, 이견 있으면 "학자들 사이 의견이 갈리지만 흔히…" (영어면 "scholars are divided, but commonly…") 첨언.
 - 좌표·place_id·확신 없는 수치 금지.
-- 성경 미명시는 "성경에서 명확히 다루지 않음".
+- 성경 미명시는 "성경에서 명확히 다루지 않음" (영어면 "the Bible does not clearly address this").
 - 3~5문장. 사과·메타·이모지 금지.
 
-""" + _FORMAT_RULE,
+""" + _COMMON_ANSWER_RULES,
     ),
     ("user", "질문: {query}"),
 ])
