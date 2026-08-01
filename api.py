@@ -16,6 +16,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.load import dumps as lc_dumps
+from langchain_core.messages import ToolMessage
 from pydantic import BaseModel, Field
 
 from agents.places import chat as chat_orchestration
@@ -98,11 +99,52 @@ def _stream_graph(
     )
     initial_state = {"query": query, "messages": ctx_messages}
     final: dict = {}
+    # place_agent 는 create_agent 의 ReAct tool loop 를 서브그래프로 돌리기
+    # 때문에 outer stream_mode="updates" 만으론 그 사이 침묵이 길다.
+    # subgraphs=True + ["updates","messages"] 로 서브그래프 내부 이벤트까지
+    # 관통시켜, 도구 호출/완료마다 실시간 `tool` 이벤트를 흘린다.
+    #
+    # subgraphs=True 시 yield 시그니처: (namespace, mode, chunk).
+    #   namespace = () 는 outer graph, non-empty tuple 은 subgraph 노드.
+    seen_tool_starts: set[str] = set()
+    seen_tool_dones: set[str] = set()
     try:
-        for update in graph.stream(initial_state, stream_mode="updates"):
-            # update is {node_name: delta, ...}. Usually one key, but iterate
-            # defensively in case a future step fans out.
-            for node_name, delta in update.items():
+        for namespace, mode, chunk in graph.stream(
+            initial_state,
+            stream_mode=["updates", "messages"],
+            subgraphs=True,
+        ):
+            if mode == "messages":
+                # chunk = (message, metadata); metadata unused here.
+                msg = chunk[0]
+                # 도구 호출 시작: AIMessage(Chunk) 의 tool_calls 목록에서
+                # 처음 보는 id 마다 한 번씩 `tool` 이벤트 발화.
+                for tc in getattr(msg, "tool_calls", None) or []:
+                    tc_id = tc.get("id")
+                    if tc_id and tc_id not in seen_tool_starts:
+                        seen_tool_starts.add(tc_id)
+                        yield _sse_event("tool", {
+                            "id": tc_id,
+                            "name": tc.get("name"),
+                            "phase": "start",
+                        })
+                # 도구 완료: ToolMessage 도착 시 한 번.
+                if isinstance(msg, ToolMessage):
+                    tc_id = getattr(msg, "tool_call_id", None)
+                    if tc_id and tc_id not in seen_tool_dones:
+                        seen_tool_dones.add(tc_id)
+                        yield _sse_event("tool", {
+                            "id": tc_id,
+                            "name": msg.name,
+                            "phase": "done",
+                        })
+                continue
+
+            # mode == "updates" — outer graph 의 노드 완료 이벤트만 전송.
+            # subgraph 노드 업데이트(namespace != ()) 는 노이즈라 스킵.
+            if namespace:
+                continue
+            for node_name, delta in chunk.items():
                 yield _sse_event("node", {"node": node_name, "update": delta})
                 if delta:
                     for key in ("answer", "place_id_map", "recommended_questions"):
