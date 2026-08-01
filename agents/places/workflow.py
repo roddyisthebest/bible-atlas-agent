@@ -20,6 +20,7 @@ The runtime layout:
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -164,6 +165,20 @@ def router(state: AgentState) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Shared prompt fragments
+# ---------------------------------------------------------------------------
+# answer 생성 노드 공통 출력 형식 규칙. 프론트가 문단 단위로 렌더할 수 있도록
+# 논리 단위 사이를 반드시 \n\n 으로 분리하도록 강제한다.
+_FORMAT_RULE = (
+    "**출력 형식 규칙**\n"
+    "- 답변이 논리적으로 둘 이상의 단위로 나뉘면 각 단위 사이는 반드시 "
+    "개행 두 번(`\\n\\n`)으로 문단을 분리하세요.\n"
+    "- 한 문단으로 충분한 짧은 답은 그대로 한 문단으로 유지합니다.\n"
+    "- 문단 내부에서 임의 줄바꿈은 사용하지 않습니다."
+)
+
+
+# ---------------------------------------------------------------------------
 # place_agent
 # ---------------------------------------------------------------------------
 # PRD (docs/agent-prd.md) 가 시스템 프롬프트의 canonical source.
@@ -175,7 +190,7 @@ PLACE_AGENT_SYSTEM = _PRD_PATH.read_text(encoding="utf-8")
 _place_agent_runnable = create_agent(
     model=llm,
     tools=tool_list,
-    system_prompt=PLACE_AGENT_SYSTEM,
+    system_prompt=PLACE_AGENT_SYSTEM + "\n\n" + _FORMAT_RULE,
 )
 
 
@@ -197,6 +212,8 @@ bible_general_agent_prompt = PromptTemplate.from_template(
 - 확신 없으면 "성경에서 명확히 다루지 않는다".
 - 서두·맺음말·이모지 금지.
 
+""" + _FORMAT_RULE + """
+
 질문: {query}
 """
 )
@@ -212,7 +229,13 @@ def bible_general_agent(state: AgentState) -> dict:
 # non_bible_reject
 # ---------------------------------------------------------------------------
 class NonBibleResponse(BaseModel):
-    answer: str = Field(description="성경 무관하다는 정중한 안내. 1~2문장. 사용자 질문 언어와 동일.")
+    answer: str = Field(
+        description=(
+            "성경 도메인 밖 질문에 대한 안내 답변. 3~5문장, "
+            "문단 구분을 위해 반드시 개행 두 번(\\n\\n) 포함. "
+            "사용자 질문 언어와 동일."
+        )
+    )
     recommended_questions: list[str] = Field(
         default_factory=list,
         max_length=3,
@@ -223,10 +246,22 @@ class NonBibleResponse(BaseModel):
 non_bible_reject_prompt = ChatPromptTemplate.from_messages([
     (
         "system",
-        """사용자 질문이 성경 도메인 밖. 두 필드 채워 반환:
-- answer: 1~2문장, "성경 무관해 답변 어렵다"는 정중한 안내.
-- recommended_questions: 성경 지리·지명 예시 질문 3개, 원 질문 맥락과 연결 가능하면 그 쪽으로.
-언어는 사용자 질문 언어(한국어/영어)와 동일. 이모지·부연 금지.""",
+        """당신은 성경 지리·지명·여정 전문 도우미입니다.
+사용자의 이번 질문은 이 도메인 밖입니다. 아래 두 필드를 채워 반환하세요.
+
+[answer 작성 규칙]
+- 총 3~5문장.
+- 다음 세 부분으로 구성하고, **각 부분 사이는 반드시 개행 두 번(`\\n\\n`)** 으로 문단 구분:
+    1) 사용자의 질문 의도를 한 문장으로 짚어 공감.
+    2) 본 서비스는 성경의 지명·지리·여정에 특화되어 있어 해당 주제는 상세히 답하기 어렵다는 안내.
+    3) 관련해서 도와드릴 수 있는 방향(성경 지리·여정 등)으로 자연스럽게 연결하는 한 문장.
+- 한국어면 반드시 존댓말(-습니다체). 반말·평서체(-다) 금지.
+- 사과의 반복, 이모지, 과장 표현 금지.
+
+[recommended_questions 작성 규칙]
+- 성경 지리·지명 예시 질문 정확히 3개.
+- 원 질문의 맥락(지역·인물·시대·주제 등)과 조금이라도 연결 가능하면 그 방향으로 제시.
+- 언어는 사용자 질문 언어(한국어/영어)와 동일.""",
     ),
     ("user", "질문: {query}"),
 ])
@@ -325,7 +360,9 @@ rewrite_prompt = ChatPromptTemplate.from_messages([
 - 확실한 사실은 단정, 이견 있으면 "학자들 사이 의견이 갈리지만 흔히…" 첨언.
 - 좌표·place_id·확신 없는 수치 금지.
 - 성경 미명시는 "성경에서 명확히 다루지 않음".
-- 3~5문장. 사과·메타·이모지 금지.""",
+- 3~5문장. 사과·메타·이모지 금지.
+
+""" + _FORMAT_RULE,
     ),
     ("user", "질문: {query}"),
 ])
@@ -340,17 +377,34 @@ def rewrite(state: AgentState) -> dict:
 # ---------------------------------------------------------------------------
 # format (place_id 매핑 추출 + 답변 확정)
 # ---------------------------------------------------------------------------
+_TRAILING_DIGITS_RE = re.compile(r"\s*\d+$")
+
+
+def _normalize_place_name(name: str) -> str:
+    """DB 동명이인 구분용 접미 숫자를 제거해 base name 을 만든다.
+
+    예) "안디옥1" → "안디옥", "안디옥 2" → "안디옥", "Antioch3" → "Antioch".
+    이렇게 하면 (a) 고대·현대가 같은 이름을 가질 때, (b) DB 가 숫자 접미로
+    동명을 구분해 저장했을 때, place_id_map 이 base name 하나의 key 로
+    모든 후보 id 를 버킷팅한다. 이름 전체가 숫자면 원본 유지.
+    """
+    stripped = _TRAILING_DIGITS_RE.sub("", name).rstrip()
+    return stripped or name
+
+
 def _extract_place_refs(tool_message_content: str) -> dict[str, list[str]]:
     """도구 결과 JSON 에서 {이름: [place_id, ...]} 매핑을 뽑는다.
 
     - top-level record + nested modern_places / ancient_places 재귀 순회.
-    - 같은 이름에 여러 place_id 가 붙을 수 있음 (부모/자식 동일 영문명 등).
+    - 같은 이름(정규화 후)에 여러 place_id 가 붙을 수 있음
+      (부모/자식 동일명, 동명이인 접미 숫자 등).
     - id 첫 글자로 stereo 판별 가능 (a... = ancient, m... = modern).
     """
     refs: dict[str, list[str]] = {}
 
     def _add(name: str, pid: str) -> None:
-        bucket = refs.setdefault(name, [])
+        key = _normalize_place_name(name)
+        bucket = refs.setdefault(key, [])
         if pid not in bucket:
             bucket.append(pid)
 
@@ -386,10 +440,24 @@ def _merge_refs(dst: dict[str, list[str]], src: dict[str, list[str]]) -> None:
                 bucket.append(pid)
 
 
+_PLACE_ID_MAP_BLOCK_RE = re.compile(
+    r"\n+\s*\**\s*place[_ ]?id[_ ]?map\s*\**\s*:.*\Z",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_place_id_map_block(text: str) -> str:
+    """답변 말미에 LLM 이 place_id_map 을 markdown 으로 다시 나열하는 경우
+    (PRD Rule 11 위반) 를 방어적으로 잘라낸다. 프롬프트가 실패해도 프론트로
+    는 절대 나가지 않게 하는 최후 방어선."""
+    return _PLACE_ID_MAP_BLOCK_RE.sub("", text).rstrip()
+
+
 def format(state: AgentState) -> dict:
     messages = state["messages"]
     # rewrite 에서 answer 이미 세팅됐으면 그것 보존, 아니면 마지막 메시지 사용
     answer_text = state.get("answer") or messages[-1].content
+    answer_text = _strip_place_id_map_block(answer_text)
 
     place_id_map: dict[str, list[str]] = {}
     for msg in messages:
