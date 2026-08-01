@@ -25,7 +25,7 @@ from typing import Literal
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from langchain_openai import ChatOpenAI
@@ -99,47 +99,68 @@ tool_list = [
 class Route(BaseModel):
     target: Literal["place_agent", "bible_general_agent", "non_bible_reject"] = Field(
         description=(
-            "사용자 질문을 분류할 대상 노드. "
+            "사용자 질문을 분류할 대상 노드입니다. "
             "성경의 지명·지리·여정에 관한 질문은 'place_agent', "
             "성경 관련이지만 장소가 초점이 아닌 질문(인물·교리·사건·해석 등)은 'bible_general_agent', "
-            "성경과 무관한 질문은 'non_bible_reject'로 분류한다."
+            "성경과 무관한 질문은 'non_bible_reject' 로 분류합니다."
         )
     )
 
 
-router_system_prompt = """
-당신은 사용자 질문을 아래 세 target 중 하나로 분류하는 라우터입니다.
-target은 반드시 'place_agent', 'bible_general_agent', 'non_bible_reject' 중 하나여야 합니다.
+router_system_prompt = """사용자 질문을 세 target 중 하나로 분류:
+- `place_agent`: 성경 지명·지리·여정·현대 위치 관계
+- `bible_general_agent`: 성경 인물·교리·구절 해석·개념 (장소 중심 아님)
+- `non_bible_reject`: 성경 무관
 
-- 'place_agent': 질문이 성경의 지리·장소에 관한 경우.
-  성경 지명(고대/현대), 인물·집단의 이동 경로·여정, 지역의 위치·의미,
-  성경 지역과 현대 위치의 관계 등을 묻는 질문이 여기에 해당한다.
-- 'bible_general_agent': 질문이 성경과 관련 있지만 장소가 주된 초점이 아닌 경우.
-  성경 인물의 성품·행적, 교리·신학, 사건의 의미, 구절 해석,
-  신앙적 개념, 성경적 지침 등이 여기에 해당한다.
-- 'non_bible_reject': 질문이 성경 도메인과 무관한 경우.
-  일상 잡담, 시사, 기술, 요리, 날씨, 취미 등 성경과 관련 없는
-  모든 질문이 여기에 해당한다.
+규칙:
+- 성경 지명·여정 명시 → place_agent
+- 성경 개념·인물·구절인데 장소 초점 아님 → bible_general_agent
+- 성경 요소 없음 → non_bible_reject
+- 애매하면 성경 쪽, 장소 조금이라도 관련되면 place_agent
 
-판단 규칙:
-- 질문에 성경 지명이 명시적으로 등장하거나 인물·집단의 '이동/여정'을 묻는다면 'place_agent'.
-- 성경에 등장하는 개념·인물·구절·교리를 묻지만 장소 이동이 초점이 아니라면 'bible_general_agent'.
-- 성경적 요소가 전혀 없다면 'non_bible_reject'.
-- 애매하면 성경 도메인 쪽으로 우선 분류하고, 장소가 조금이라도 관련되면 'place_agent'를 선택한다.
-
-target만 반환하고 다른 텍스트는 출력하지 마세요.
+**context 활용**: 현재 질문이 지시대명사(그곳/거기/그때 등)나 후속 표현(그럼~/이후에 등)을 포함하고 [context]가 성경 지리면 place_agent, 성경 인물·교리면 bible_general_agent 로 유지. context 가 "(없음)"이고 현재 질문에 성경 신호 없으면 non_bible_reject. 이전과 무관한 새 주제면 현재 질문 기준.
 """
 
 router_prompt = ChatPromptTemplate.from_messages([
     ("system", router_system_prompt),
-    ("user", "{query}"),
+    ("user", "[context]\n{context}\n\n[현재 질문]\n{query}"),
 ])
 
 router_chain = router_prompt | small_llm.with_structured_output(Route)
 
 
+def _build_router_context(messages: list) -> str:
+    """Compact context for router: summary (if any) + last ~2 exchanges.
+
+    messages 구조 (chat.build_context 결과):
+        [SystemMessage(summary)?, HumanMessage(q1), AIMessage(a1), ...,
+         HumanMessage(current_query)]
+    현재 질문(last HumanMessage)은 별도 slot 으로 넘기므로 여기서 제외.
+    """
+    if len(messages) <= 1:
+        return "(없음)"
+
+    lines: list[str] = []
+    for msg in messages[:-1]:
+        if isinstance(msg, SystemMessage):
+            lines.append(msg.content)
+        elif isinstance(msg, HumanMessage):
+            lines.append(f"user: {msg.content[:300]}")
+        elif isinstance(msg, AIMessage):
+            lines.append(f"assistant: {msg.content[:300]}")
+
+    if not lines:
+        return "(없음)"
+    # 요약 있으면 그대로 유지, 그 뒤로 최근 대화 최대 4줄만.
+    return "\n".join(lines[-5:])
+
+
 def router(state: AgentState) -> str:
-    return router_chain.invoke({"query": state["query"]}).target
+    context = _build_router_context(state.get("messages") or [])
+    return router_chain.invoke({
+        "query": state["query"],
+        "context": context,
+    }).target
 
 
 # ---------------------------------------------------------------------------
@@ -169,18 +190,15 @@ def place_agent(state: AgentState) -> dict:
 # bible_general_agent
 # ---------------------------------------------------------------------------
 bible_general_agent_prompt = PromptTemplate.from_template(
-    """
-    당신은 성경 질문에 답하는 도우미입니다.
-    아래 규칙을 반드시 지키세요.
+    """성경 질문 응답 도우미.
+규칙:
+- 한국어면 반드시 존댓말(-습니다체). 반말·평서체(-다) 금지.
+- 3~5문장 이내, 성경 본문·인물·사건·신학에 한정.
+- 확신 없으면 "성경에서 명확히 다루지 않는다".
+- 서두·맺음말·이모지 금지.
 
-    규칙:
-    - 3~5문장 이내로 간결하게 답합니다.
-    - 성경 본문·인물·사건·신학 주제에 한정된 답변만 합니다.
-    - 확신할 수 없는 부분은 추측하지 말고 "성경에서 명확히 다루지 않는다"고 답합니다.
-    - 불필요한 서두·맺음말·이모지는 사용하지 않습니다.
-
-    질문: {query}
-    """
+질문: {query}
+"""
 )
 
 bible_general_agent_chain = bible_general_agent_prompt | mini_llm | StrOutputParser()
@@ -194,36 +212,21 @@ def bible_general_agent(state: AgentState) -> dict:
 # non_bible_reject
 # ---------------------------------------------------------------------------
 class NonBibleResponse(BaseModel):
-    answer: str = Field(
-        description=(
-            "질문이 성경 도메인과 무관하다는 안내 메시지. 1~2문장. 정중하고 짧게."
-        )
-    )
+    answer: str = Field(description="성경 무관하다는 정중한 안내. 1~2문장. 사용자 질문 언어와 동일.")
     recommended_questions: list[str] = Field(
         default_factory=list,
         max_length=3,
-        description=(
-            "사용자가 대신 물어볼 만한 성경 지리·지명 관련 예시 질문 3개. "
-            "가능하면 사용자의 원 질문 맥락(주제·인물·상황)과 연결지어 유도. "
-            "질문 형태로 작성."
-        ),
+        description="대체 질문 3개. 원 질문 맥락과 연결지어 성경 지리·지명 예시 질문 형태로.",
     )
 
 
 non_bible_reject_prompt = ChatPromptTemplate.from_messages([
     (
         "system",
-        """
-        사용자의 질문이 성경 도메인과 무관합니다.
-        아래 두 필드를 채워 반환하세요.
-
-        - answer: 1~2문장. "성경과 무관한 질문이라 답변이 어렵다"는 취지의 정중한 안내.
-        - recommended_questions: 사용자가 대신 물어볼 만한 성경 지리·지명 관련
-          예시 질문 3개. 원 질문의 주제·인물·상황과 조금이라도 연결 가능하면
-          그 쪽으로 유도.
-
-        이모지·부연 설명은 넣지 마세요.
-        """,
+        """사용자 질문이 성경 도메인 밖. 두 필드 채워 반환:
+- answer: 1~2문장, "성경 무관해 답변 어렵다"는 정중한 안내.
+- recommended_questions: 성경 지리·지명 예시 질문 3개, 원 질문 맥락과 연결 가능하면 그 쪽으로.
+언어는 사용자 질문 언어(한국어/영어)와 동일. 이모지·부연 금지.""",
     ),
     ("user", "질문: {query}"),
 ])
@@ -254,30 +257,58 @@ class RelevanceCheck(BaseModel):
 relevance_prompt = ChatPromptTemplate.from_messages([
     (
         "system",
-        """
-        당신은 답변이 질문에 얼마나 잘 부합하는지 평가하는 판정자입니다.
-        아래 기준으로만 판단하세요.
+        """당신은 답변이 사용자 질문과 도구 검색 결과에 얼마나 잘 부합하는지
+평가하는 판정자입니다.
 
-        기준:
-        - 답변이 질문의 요지를 정면으로 다루고 있는가.
-        - 명백한 사실적 오류가 있는가.
-        - 질문과 무관한 내용으로 회피하고 있는가.
-        - 답변이 비어 있거나 지나치게 모호한가.
+판단 기준:
+- 답변이 질문의 요지를 정면으로 다루는가.
+- 도구 결과가 있으면 답변이 그 결과에 근거하는가.
+- 서로 다른 장소를 하나로 합치거나, 도구 결과에 없는 place_id/좌표/현대
+  지명을 만들어내지 않았는가.
+- 명백한 사실 오류나 회피성 답변이 아닌가.
 
-        기준을 모두 만족하면 is_relevant=true, 하나라도 어긋나면 false.
-        간결하게 판단하고 부연 설명은 하지 마세요.
-        """,
+**아래 조건 중 하나라도 해당하면 반드시 is_relevant = false:**
+1. 도구 결과가 전부 비어있고([] 또는 빈 문자열), 답변에
+   "정보가 없다", "명확한 지명이 제공되지 않았", "구체적 자료가 없",
+   "다른 자료를 참고", "명시되지 않았", "제공되지 않았"
+   같은 정보 부족을 인정하는 표현이 있는 경우.
+   → rewrite 노드가 LLM 사전 지식으로 더 나은 답변을 만들어야 함.
+2. 답변이 질문의 핵심(지명·인물·사건)을 다루지 못하고 회피.
+3. 답변이 비어있거나 지나치게 모호.
+
+**예외 - 다음은 is_relevant = true 허용:**
+- 질문 자체가 성경 밖 초월적/추상적 주제(예: "천국은 어디?")이고
+  답변이 성경적 관점에서 적절히 짚어준 경우.
+- 도구 결과가 존재하고 답변이 그 결과와 일관되게 작성된 경우.
+
+reason에는 판단 근거 한 문장만 짧게.""",
     ),
-    ("user", "질문: {query}\n답변: {answer}"),
+    (
+        "user",
+        """질문:
+{query}
+
+도구 검색 결과:
+{tool_results}
+
+최종 답변:
+{answer}""",
+    ),
 ])
 
 relevance_chain = relevance_prompt | judge_llm.with_structured_output(RelevanceCheck)
 
 
 def evaluate_answer(state: AgentState) -> Literal["rewrite", "format"]:
+    tool_results = [
+        message.content
+        for message in state["messages"]
+        if isinstance(message, ToolMessage)
+    ]
     check = relevance_chain.invoke({
         "query": state["query"],
         "answer": state["messages"][-1].content,
+        "tool_results": tool_results,
     })
     return "rewrite" if not check.is_relevant else "format"
 
@@ -288,20 +319,13 @@ def evaluate_answer(state: AgentState) -> Literal["rewrite", "format"]:
 rewrite_prompt = ChatPromptTemplate.from_messages([
     (
         "system",
-        """
-        당신은 성경 지리·지명 전문가입니다.
-        데이터베이스 검색으로 충분한 정보를 얻지 못해, 이번 답변은
-        당신의 성경 사전 지식에만 의존해 작성해야 합니다.
-
-        지침:
-        - 성경 본문·전통·널리 알려진 학설 수준의 정보로 답합니다.
-        - 확실히 알려진 사실은 단정적으로 답합니다.
-        - 학자 간 이견이 있는 부분은 "학자들 사이에 의견이 갈리지만 흔히…" 같은 표현을 붙입니다.
-        - 정확한 좌표, place_id, 확신할 수 없는 세부 수치는 답하지 마세요.
-        - 성경이 명시하지 않은 사항은 "성경에서 명확히 다루지 않음"이라고 답합니다.
-        - 3~5문장 이내로 간결하게 작성합니다.
-        - 사과·메타 발언·이모지는 넣지 않습니다.
-        """,
+        """성경 지리·지명 전문가. DB 결과 부족해 사전 지식만으로 답.
+- 한국어면 반드시 존댓말(-습니다체). 반말·평서체(-다) 금지.
+- 성경 본문·전통·널리 알려진 학설 수준.
+- 확실한 사실은 단정, 이견 있으면 "학자들 사이 의견이 갈리지만 흔히…" 첨언.
+- 좌표·place_id·확신 없는 수치 금지.
+- 성경 미명시는 "성경에서 명확히 다루지 않음".
+- 3~5문장. 사과·메타·이모지 금지.""",
     ),
     ("user", "질문: {query}"),
 ])
