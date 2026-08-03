@@ -28,7 +28,7 @@ from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, MessagesState, StateGraph
 from pydantic import BaseModel, Field
@@ -76,6 +76,10 @@ mini_llm = ChatOpenAI(model="gpt-4o-mini", max_tokens=400, temperature=0.2)
 nano_llm = ChatOpenAI(model="gpt-4.1-nano", max_tokens=300, temperature=0.3)
 judge_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 rewrite_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2, max_tokens=500)
+# 라우터는 결정적 분류가 필요 (temperature=0). 기본값 1.0 이면 같은
+# 짧은 입력("아", "?" 등) 이 실행마다 다른 target 으로 튀어서 non_bible_reject
+# 이 안정적으로 잡히지 않음.
+router_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 
 # ---------------------------------------------------------------------------
@@ -117,9 +121,28 @@ router_system_prompt = """사용자 질문을 세 target 중 하나로 분류:
 - 성경 지명·여정 명시 → place_agent
 - 성경 개념·인물·구절인데 장소 초점 아님 → bible_general_agent
 - 성경 요소 없음 → non_bible_reject
-- 애매하면 성경 쪽, 장소 조금이라도 관련되면 place_agent
+
+**짧거나 의미 없는 입력 처리** (매우 중요):
+- 1~3자 정도의 짧은 감탄사·의성어·개별 문자("아", "ㅇㅇ", "?", "ㅋㅋ", ".",
+  "asdf" 등) 는 성경 신호가 아니므로 무조건 `non_bible_reject`.
+- 아래 예외에서만 짧은 입력을 성경 쪽으로 유지:
+    (a) [context] 에 명확한 성경 주제가 있고,
+        현재 입력이 "그럼", "이후에", "그다음" 등 후속 표현일 때.
+- "애매하면 성경 쪽" 규칙은 짧은/의미없는 입력에는 적용하지 않는다.
+  성경 신호가 명확히 있을 때만 성경 쪽으로.
 
 **context 활용**: 현재 질문이 지시대명사(그곳/거기/그때 등)나 후속 표현(그럼~/이후에 등)을 포함하고 [context]가 성경 지리면 place_agent, 성경 인물·교리면 bible_general_agent 로 유지. context 가 "(없음)"이고 현재 질문에 성경 신호 없으면 non_bible_reject. 이전과 무관한 새 주제면 현재 질문 기준.
+
+**애매하면 성경 쪽** — 단, 위 "짧거나 의미 없는 입력 처리" 규칙이 우선. 성경 신호가 조금이라도 있고 장소 관련이면 place_agent.
+
+분류 예시:
+- "아" → non_bible_reject   (감탄사, 성경 신호 없음)
+- "ㅇㅇ" → non_bible_reject   (초성/응답)
+- "?" → non_bible_reject
+- "asdf" → non_bible_reject
+- "베들레헴 어디" → place_agent
+- "예수님이 뭘 가르쳤어" → bible_general_agent
+- (context: 아담과 하와 에덴) + "추방된 이후에" → place_agent   (후속 표현 + 지리 context)
 """
 
 router_prompt = ChatPromptTemplate.from_messages([
@@ -127,7 +150,7 @@ router_prompt = ChatPromptTemplate.from_messages([
     ("user", "[context]\n{context}\n\n[현재 질문]\n{query}"),
 ])
 
-router_chain = router_prompt | small_llm.with_structured_output(Route)
+router_chain = router_prompt | router_llm.with_structured_output(Route)
 
 
 def _build_router_context(messages: list) -> str:
@@ -216,24 +239,33 @@ def place_agent(state: AgentState) -> dict:
 # ---------------------------------------------------------------------------
 # bible_general_agent
 # ---------------------------------------------------------------------------
-bible_general_agent_prompt = PromptTemplate.from_template(
-    """성경 질문 응답 도우미.
+bible_general_agent_prompt = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        """성경 질문 응답 도우미.
 규칙:
 - 3~5문장 이내, 성경 본문·인물·사건·신학에 한정.
 - 확신 없으면 "성경에서 명확히 다루지 않는다" (영어면 "the Bible does not clearly address this").
 - 서두·맺음말·이모지 금지.
 
-""" + _COMMON_ANSWER_RULES + """
+**멀티턴 컨텍스트 활용**: 아래 이전 대화가 주어지면 현재 사용자
+질문에 포함된 지시어·시점 표현(그럼/이후/그때/거기 등)의 지시대상을
+그 컨텍스트에서 반드시 해석하세요. "여러 의미가 있다" 같은 회피성
+답변 금지 — 컨텍스트가 있으면 대상을 특정해 답하세요.
 
-질문: {query}
-"""
-)
+""" + _COMMON_ANSWER_RULES,
+    ),
+    MessagesPlaceholder("messages"),
+])
 
 bible_general_agent_chain = bible_general_agent_prompt | mini_llm | StrOutputParser()
 
 
 def bible_general_agent(state: AgentState) -> dict:
-    return {"answer": bible_general_agent_chain.invoke({"query": state["query"]})}
+    # state["messages"] 는 chat.build_context 가 조립한 결과:
+    #   [SystemMessage(summary)?, HumanMessage(q1), AIMessage(a1), ..., HumanMessage(현재 query)]
+    # MessagesPlaceholder 로 그대로 넘겨 LLM 이 히스토리 + 현재 질문을 함께 본다.
+    return {"answer": bible_general_agent_chain.invoke({"messages": state["messages"]})}
 
 
 # ---------------------------------------------------------------------------
@@ -264,12 +296,17 @@ non_bible_reject_prompt = ChatPromptTemplate.from_messages([
         _COMMON_ANSWER_RULES + """
 
 You are a specialist assistant for **biblical places, geography, and journeys**.
-The user's current question is outside this domain. Fill the two fields below and return.
+The user's current question (the LAST user message below) is outside this domain.
+Fill the two fields below and return.
 
-**CRITICAL: The [Language Rule] above is absolute.** Detect the user's query language
-and write EVERY field (answer + every recommended_questions entry) in that same
-language. Korean query → all Korean output. English query → all English output.
-Do NOT default to Korean. Do NOT mix languages.
+**CRITICAL: The [Language Rule] above is absolute.** Detect the language of the
+LAST user message and write EVERY field (answer + every recommended_questions entry)
+in that same language. Korean → all Korean. English → all English. Do NOT default
+to Korean. Do NOT mix languages.
+
+**Multi-turn context**: Prior turns (if any) appear as messages below. Use them
+only to bias `recommended_questions` toward the user's ongoing thread — do NOT
+try to answer the off-topic query itself.
 
 [answer content]
 - Exactly 3–5 sentences, structured as three parts separated by `\\n\\n`:
@@ -281,18 +318,19 @@ Do NOT default to Korean. Do NOT mix languages.
 
 [recommended_questions content]
 - Exactly 3 example questions about biblical places or geography.
-- If the original question has any thread (region, person, era, theme) that can
-  bridge into biblical geography, bias the examples toward that thread.
-- Each example question MUST be in the same language as the user's query.
+- If the original question OR prior turns have any thread (region, person, era,
+  theme) that can bridge into biblical geography, bias the examples toward it.
+- Each example question MUST be in the same language as the user's current query.
 
 [Language detection examples — follow this pattern strictly]
-- Query "What's your favorite movie?" → detect language = English → answer in English, recommended_questions in English.
-- Query "where is the money" → English → English output.
-- Query "오늘 날씨 어때?" → Korean → Korean output.
-- Query "돈 어디있어" → Korean → Korean output.
-Detect the query language BEFORE writing anything, then commit to that language for every field.""",
+- Current message "What's your favorite movie?" → English → all English output.
+- Current message "where is the money" → English → English output.
+- Current message "오늘 날씨 어때?" → Korean → Korean output.
+- Current message "돈 어디있어" → Korean → Korean output.
+Detect the language of the LAST user message BEFORE writing anything, then commit
+to that language for every field.""",
     ),
-    ("user", "User query (detect language, respond in that same language): {query}"),
+    MessagesPlaceholder("messages"),
 ])
 
 # nano 모델은 다국어 + 문단 형식 같은 복합 지시를 잘 못 따라가서
@@ -303,7 +341,9 @@ non_bible_reject_chain = (
 
 
 def non_bible_reject(state: AgentState) -> dict:
-    result = non_bible_reject_chain.invoke({"query": state["query"]})
+    # 히스토리를 함께 넘겨서 recommended_questions 를 진행 중인 주제 흐름에
+    # 맞게 편향할 수 있게 한다. answer 자체는 여전히 off-topic 안내.
+    result = non_bible_reject_chain.invoke({"messages": state["messages"]})
     return {
         "answer": result.answer,
         "recommended_questions": result.recommended_questions,
@@ -392,16 +432,26 @@ rewrite_prompt = ChatPromptTemplate.from_messages([
 - 성경 미명시는 "성경에서 명확히 다루지 않음" (영어면 "the Bible does not clearly address this").
 - 3~5문장. 사과·메타·이모지 금지.
 
+**멀티턴 컨텍스트 활용**: 아래 이전 대화가 주어지면 현재 사용자
+질문에 포함된 지시어·시점 표현(그럼/이후/그때/거기 등)의 지시대상을
+그 컨텍스트에서 반드시 특정하세요. "여러 사건이 있을 수 있다" 같은
+회피성 답변 금지. 컨텍스트가 있으면 그 흐름에 따라 대상을 확정해
+답하세요.
+
 """ + _COMMON_ANSWER_RULES,
     ),
-    ("user", "질문: {query}"),
+    MessagesPlaceholder("messages"),
 ])
 
 rewrite_chain = rewrite_prompt | rewrite_llm | StrOutputParser()
 
 
 def rewrite(state: AgentState) -> dict:
-    return {"answer": rewrite_chain.invoke({"query": state["query"]})}
+    # place_agent 의 tool loop 후 state["messages"] 에는 최근 tool 호출/응답도
+    # 포함돼 있음. rewrite 는 그걸 그대로 노출하기보다 사용자-어시스턴트
+    # 히스토리와 현재 질문만 넘기는 편이 답 품질에 낫지만, 단순히 messages
+    # 를 그대로 넘겨도 LLM 이 시스템 프롬프트 지시대로 처리 가능.
+    return {"answer": rewrite_chain.invoke({"messages": state["messages"]})}
 
 
 # ---------------------------------------------------------------------------
