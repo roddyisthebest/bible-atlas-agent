@@ -41,8 +41,23 @@ _pool = ConnectionPool(
 )
 
 
-keyword_llm = ChatOpenAI(model="gpt-5.6-luna",temperature=0)
-journey_llm = ChatOpenAI(model="gpt-4o-mini")
+keyword_llm = ChatOpenAI(
+    model="gpt-5-mini",
+    temperature=0,
+)
+
+# 전체 여정 장소 순서 복원
+journey_route_llm = ChatOpenAI(
+    model="gpt-5.6-luna",
+    reasoning_effort="none",
+    temperature=0,
+)
+
+# 여정에 대한 3~5문장 설명 생성
+journey_description_llm = ChatOpenAI(
+    model="gpt-5-mini",
+    temperature=0,
+)
 
 keyword_search_prompt = PromptTemplate.from_template(
     """
@@ -101,46 +116,54 @@ keyword_search_chain = keyword_search_prompt | keyword_llm.with_structured_outpu
 journey_route_search_prompt = PromptTemplate.from_template(
     """
 사용자의 질문에서 성경 속 인물이나 집단의 이동 여정을 파악하고,
-관련 장소명을 실제 이동 순서대로 모두 반환하세요.
+해당 인물이나 집단이 성경 본문에서 직접 이동하거나 체류한 장소를
+실제 이동 순서대로 모두 반환하세요.
 
 규칙:
-- 도시, 지역, 산, 강, 광야, 항구, 건물 등 이동 경로와 관련된 장소를 포함하세요.
+- 도시, 지역, 산, 강, 광야, 항구, 건물 등 실제 이동 또는 체류 장소를 포함하세요.
+- 단순히 언급된 장소, 주변 장소, 다른 인물만 방문한 장소는 제외하세요.
+- 각 장소는 해당 인물이나 집단이 그곳으로 이동하거나 머물렀다고
+  명시된 성경 구절을 특정할 수 있어야 합니다.
+- 근거 구절을 특정할 수 없는 장소는 추측하여 추가하지 마세요.
 - 반드시 출발지부터 도착지까지 순서대로 정렬하세요.
 - 질문에서 요구한 여정 구간에 해당하는 장소만 반환하세요.
 - 실제로 같은 장소를 다시 방문했다면 중복을 유지하세요.
+- 여정 전체를 빠짐없이 반환하세요. 유명한 지점만 뽑고
+  중간 경로를 생략하지 마세요. 개수 상한은 없습니다.
+
+- 상위 지역과 그 안의 구체적인 장소가 본문에서 각각 이동 또는 체류
+  장소로 등장하면 둘 다 포함하세요.
+  
+- 상위 지역과 세부 장소는 동일 지명의 표기 차이가 아니므로
+  중복으로 제거하지 마세요.
+
+- 인물 소속 표현 대체:
+  "X's House", "X's Camp", "X's Tent" 같은 표현은 사건이 실제로
+  일어난 성경 지명으로 대체하세요. 지명을 특정할 수 없는 경우에만 생략하세요.
+
+- 같은 장소를 단순한 표기 차이로 두 번 넣지 마세요.
+  예: "En Gedi"와 "Engedi"를 함께 반환하지 마세요.
+  단, Wilderness of Ziph, Mount Sinai처럼 별도의 자연지형은
+  실제 이동 장소라면 포함하세요.
+
 - 이동 순서를 신뢰할 수 없거나 여정 질문이 아니면 빈 목록을 반환하세요.
 - 설명 없이 장소명 배열만 반환하세요.
 
-**출력 규칙 (매우 중요):**
-- 장소 이름은 반드시 **영어 성경 표준 표기**로만 출력합니다.
-  한국어(안디옥·구브로 등)나 음차(안티오크·키프로스 등)는 절대 사용 금지.
-  반드시 영어(Antioch·Cyprus·Salamis·Paphos·Perga·Iconium·Lystra·Derbe 등)로 반환.
-- 이유: DB에서 이름 매칭이 안정적으로 되기 위함입니다. 한국어 표기는 변형이
-  많아(안디옥/안티옥/안티오크 등) 매칭이 자주 실패합니다.
-- 개역개정 성경의 영어 병기 이름 또는 널리 알려진 영어 성경(NIV, ESV 등)의
-  표기를 사용하세요.
+출력 규칙:
+- 장소 이름은 반드시 영어 성경 표준 표기로만 출력하세요.
+- 한국어 또는 음차 표기는 사용하지 마세요.
+- 개역개정 영어 병기 또는 NIV, ESV 등에서 널리 쓰이는 표기를 사용하세요.
 
-**추상적·개념적 지명 금지 (매우 중요):**
-- 성경에 실제로 등장하는 **구체적이고 고유한 지명**만 사용하세요.
-- 아래처럼 개념·상징·목적지를 지칭하는 추상 표현은 **절대 포함하지 마세요**:
-  - "Promised Land" / "Land of Promise" → "Canaan"으로 대체
-  - "the wilderness" / "the desert" (일반) → 구체적 광야명 사용
-    (예: "Wilderness of Shur", "Wilderness of Sin", "Wilderness of Paran")
-  - "Heaven", "Hell", "Paradise" 같은 초월적 장소
-  - "홈타운", "고향", "이스라엘 땅" 같은 지시어
-- 판단 기준: 그 이름을 성경 원문에서 고유명사처럼 찾을 수 있어야 함.
-  못 찾으면 빼거나 구체적 이름으로 교체.
+추상적·개념적 지명 금지:
+- 성경에 실제로 등장하는 구체적인 고유 지명만 사용하세요.
+- "Promised Land"는 "Canaan"으로 대체하세요.
+- "the wilderness"처럼 구체적 이름이 없는 표현은 제외하거나
+  Wilderness of Shur 등 명시된 광야명으로 대체하세요.
+- Heaven, Hell, Paradise 등의 초월적 장소는 제외하세요.
 
 예시:
 Q: 바울이 1차 전도여행 중 구브로에서 방문한 도시 순서는?
 A: ["Salamis", "Paphos"]
-
-Q: 바울의 2차 전도여행 여정 순서는?
-A: ["Antioch", "Syria", "Cilicia", "Derbe", "Lystra", "Iconium", "Phrygia", "Galatia", "Troas", "Philippi"]
-
-Q: 출애굽 여정을 알려줘
-A: ["Egypt", "Red Sea", "Wilderness of Shur", "Marah", "Elim", "Wilderness of Sin", "Rephidim", "Mount Sinai", "Kadesh-barnea", "Canaan"]
-  # "Promised Land"는 사용 금지, "Canaan"으로 대체함.
 
 Q: 요셉이 형들에게 팔린 곳은 어디인가요?
 A: []
@@ -167,7 +190,7 @@ class JourneyRouteResult(BaseModel):
 
 
 journey_route_search_chain = (
-    journey_route_search_prompt | journey_llm.with_structured_output(JourneyRouteResult)
+    journey_route_search_prompt | journey_route_llm.with_structured_output(JourneyRouteResult)
 )
 
 
@@ -211,7 +234,7 @@ class JourneyDescriptionResult(BaseModel):
 
 journey_description_search_chain = (
     journey_description_search_prompt
-    | journey_llm.with_structured_output(JourneyDescriptionResult)
+    | journey_description_llm.with_structured_output(JourneyDescriptionResult)
 )
 
 
