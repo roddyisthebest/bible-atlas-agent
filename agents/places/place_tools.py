@@ -101,7 +101,7 @@ keyword_search_chain = keyword_search_prompt | keyword_llm.with_structured_outpu
 journey_route_search_prompt = PromptTemplate.from_template(
     """
 사용자의 질문에서 성경 속 인물이나 집단의 이동 여정을 파악하고,
-관련 장소명을 실제 이동 순서대로 최대 10개까지 반환하세요.
+관련 장소명을 실제 이동 순서대로 모두 반환하세요.
 
 규칙:
 - 도시, 지역, 산, 강, 광야, 항구, 건물 등 이동 경로와 관련된 장소를 포함하세요.
@@ -157,10 +157,9 @@ A: []
 class JourneyRouteResult(BaseModel):
     places: list[str] = Field(
         default_factory=list,
-        max_length=10,
         description=(
             "성경 인물이나 집단이 이동한 장소를 출발지부터 도착지까지 "
-            "실제 이동 순서대로 나열한 목록. "
+            "실제 이동 순서대로 나열한 목록. 개수 제한 없음. "
             "**반드시 영어 성경 표준 표기**로 반환한다 (예: 'Antioch', 'Cyprus', 'Salamis'). "
             "한국어·음차 표기는 금지. 여정이 아니면 빈 배열."
         ),
@@ -649,9 +648,9 @@ def journey_route_search(query: str) -> list[str]:
     """성경 여정의 장소 순서(route)를 추출합니다.
 
     질문에서 언급되거나 암시된 성경 인물·집단의 이동 여정을 파악하고,
-    관련 장소들을 출발지부터 도착지까지 이동 순서대로 최대 10개까지
-    이름 문자열 리스트로 반환합니다. 여정이 아니거나 특정할 수 없으면
-    빈 리스트를 반환합니다.
+    관련 장소들을 출발지부터 도착지까지 이동 순서대로 이름 문자열
+    리스트로 반환합니다. 여정이 아니거나 특정할 수 없으면 빈 리스트를
+    반환합니다.
     """
     result = journey_route_search_chain.invoke({"query": query})
     return result.places
